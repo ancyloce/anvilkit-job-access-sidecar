@@ -1,0 +1,30 @@
+# anvilkit-job-access-sidecar configuration (reviewed, secret-free; baked
+# into the image, readable by the sidecar container only). Precedence is
+# defaults < this file < the allowlisted environment overrides the Job
+# template sets: ANVILKIT_SIDECAR_CONTROL_ADDRESS and
+# ANVILKIT_SIDECAR_IDENTITY_MODE (the environment's placement and identity
+# mode), ANVILKIT_SIDECAR_BACKEND, ANVILKIT_SIDECAR_LAUNCH_KEY,
+# ANVILKIT_SIDECAR_POD_UID (downward API metadata.uid) and
+# ANVILKIT_SIDECAR_LAUNCH_ENVELOPE (the typed launch envelope); the launch
+# facts are refused inside this file. Unknown keys fail startup. With
+# identity.mode disabled (the default) the process exits before creating a
+# socket: a Job whose environment supplies no trusted identity runs nothing.
+sockets:
+  dir: /run/anvilkit/sockets
+  trusted_uid: 0
+  candidate_uid: 10001
+  owner_uid: 10002
+control:
+  timeout: 15s
+identity:
+  mode: disabled
+  # mtls: cert_file, key_file, ca_file and server_name are the workload
+  # identity material of the production path (ENV-03), mounted into this
+  # container only.
+limits:
+  max_input_bytes: 1048576
+  max_transfer_bytes: 67108864
+  max_manifest_bytes: 16384
+  request_timeout: 60s
+  upload_timeout: 5m
+shutdown_timeout: 20s
