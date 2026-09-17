@@ -19,6 +19,7 @@ Per-job access proxy for credential isolation, scoped model and artifact access,
 | trusted | `PUT /v1/inputs/{name}` | Stages a permitted input under a confirmed scope, verified against the digest the launch envelope declares |
 | trusted | `POST /v1/transfers` | `BeginTransfer` under the scope, the one PUT the capability authorizes, `FinalizeTransfer` naming the object version and the current instance; the capability never leaves the process |
 | trusted | `POST /v1/results` | `AcceptResult` under the current instance and execution epoch; a repeat of the same bytes reenters the same stage, another result is refused by Control |
+| trusted | `GET /v1/results` | The accepted stage of the attempt as Control records it (`GetAcceptedStage`: identity, verdict, result digest, epochs, bound artifacts with their object versions; `404 NOT_FOUND` until a result is accepted), read under the result authority — the first question of the P12 joint stage recovery, never a resend or a reopening |
 | trusted | `POST /v1/model/relay` | The same controlled model relay for the trusted harness's experts |
 | trusted | `/v1/knowledge/…`, `/v1/mcp/…` | Trusted expert relays; `503 DEPENDENCY_UNAVAILABLE` until their units wire an upstream |
 
