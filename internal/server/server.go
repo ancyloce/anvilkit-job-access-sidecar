@@ -100,8 +100,9 @@ type ScopeSource interface {
 	// not registered the Pod, scope.ErrUnavailable when Control cannot be
 	// asked, scope.ErrNoAuthority for a non-current or foreign instance,
 	// scope.ErrStale for an ended attempt or a fenced operation,
-	// scope.ErrDeadline for a passed deadline.
-	Confirm(ctx context.Context, now time.Time, purpose scope.Purpose) (*scope.Scope, error)
+	// scope.ErrDeadline for a passed deadline. The clock must be read after
+	// the Control lookup, immediately before the authorization decision.
+	Confirm(ctx context.Context, now func() time.Time, purpose scope.Purpose) (*scope.Scope, error)
 	Upload(ctx context.Context, s *scope.Scope, class, mediaType string, body []byte) (*scope.Transfer, error)
 	Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, observer string, manifest []byte) (*scope.Stage, error)
 }
@@ -185,7 +186,7 @@ func (s *Server) Candidate() http.Handler {
 		}
 		// Inputs are permitted only inside an execution authority Control
 		// confirms now; staged bytes are never served on an earlier answer.
-		if _, err := s.Scope.Confirm(r.Context(), s.Now(), scope.ForNewAuthorization); !s.answerScopeError(w, err) {
+		if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
 			return
 		}
 		b, ok := s.Inputs.Get(name)
@@ -215,7 +216,7 @@ func (s *Server) Candidate() http.Handler {
 func (s *Server) Trusted() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/scope", func(w http.ResponseWriter, r *http.Request) {
-		sc, err := s.Scope.Confirm(r.Context(), s.Now(), scope.ForNewAuthorization)
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
 		if !s.answerScopeError(w, err) {
 			return
 		}
@@ -228,7 +229,7 @@ func (s *Server) Trusted() http.Handler {
 			fail(w, http.StatusRequestEntityTooLarge, "INPUT_TOO_LARGE", "")
 			return
 		}
-		if _, err := s.Scope.Confirm(r.Context(), s.Now(), scope.ForNewAuthorization); !s.answerScopeError(w, err) {
+		if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
 			return
 		}
 		if err := s.Inputs.Stage(name, body); err != nil {
@@ -248,7 +249,7 @@ func (s *Server) Trusted() http.Handler {
 			fail(w, http.StatusRequestEntityTooLarge, "TRANSFER_TOO_LARGE", "")
 			return
 		}
-		sc, err := s.Scope.Confirm(r.Context(), s.Now(), scope.ForNewAuthorization)
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
 		if !s.answerScopeError(w, err) {
 			return
 		}
@@ -281,7 +282,7 @@ func (s *Server) Trusted() http.Handler {
 			fail(w, http.StatusRequestEntityTooLarge, "RESULT_TOO_LARGE", "")
 			return
 		}
-		sc, err := s.Scope.Confirm(r.Context(), s.Now(), scope.ForResult)
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForResult)
 		if !s.answerScopeError(w, err) {
 			return
 		}
@@ -295,7 +296,7 @@ func (s *Server) Trusted() http.Handler {
 	unavailable := func(dep string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
-			if _, err := s.Scope.Confirm(r.Context(), s.Now(), scope.ForNewAuthorization); !s.answerScopeError(w, err) {
+			if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
 				return
 			}
 			fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", dep+" upstream not configured")

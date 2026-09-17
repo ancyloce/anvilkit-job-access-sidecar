@@ -31,7 +31,7 @@ type resolver struct {
 	announced bool
 }
 
-func (r *resolver) Confirm(ctx context.Context, now time.Time, purpose scope.Purpose) (*scope.Scope, error) {
+func (r *resolver) Confirm(ctx context.Context, now func() time.Time, purpose scope.Purpose) (*scope.Scope, error) {
 	s, err := r.client.Confirm(ctx, r.binding, now, purpose)
 	if err != nil {
 		return nil, err

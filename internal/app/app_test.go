@@ -30,6 +30,10 @@ import (
 	controlv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/control/v1"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/app"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/config"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/server"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
 )
 
 const (
@@ -78,24 +82,26 @@ func TestMain(m *testing.M) {
 type fakeControl struct {
 	controlv1.UnimplementedExecutionServiceServer
 	controlv1.UnimplementedArtifactServiceServer
-	mu          sync.Mutex
-	registered  bool
-	current     bool
-	deadline    time.Time
-	attempt     controlv1.AttemptState
-	lifecycle   controlv1.Lifecycle
-	control     controlv1.ControlState
-	opEpoch     string // the operation's current execution epoch
-	atEpoch     string // the attempt's execution epoch
-	launchEpoch string // the instance's launch epoch
-	noOperation bool   // a Control that reports no operation state
-	lookups     atomic.Int32
-	transfers   map[string]*controlv1.Transfer // by handle
-	finalized   map[string]bool
-	stages      map[string]string // attempt -> stage id
-	stageDigest map[string]string
-	uploadURL   string
-	accepts     int
+	mu                sync.Mutex
+	registered        bool
+	current           bool
+	deadline          time.Time
+	operationDeadline time.Time
+	afterLookup       func()
+	attempt           controlv1.AttemptState
+	lifecycle         controlv1.Lifecycle
+	control           controlv1.ControlState
+	opEpoch           string // the operation's current execution epoch
+	atEpoch           string // the attempt's execution epoch
+	launchEpoch       string // the instance's launch epoch
+	noOperation       bool   // a Control that reports no operation state
+	lookups           atomic.Int32
+	transfers         map[string]*controlv1.Transfer // by handle
+	finalized         map[string]bool
+	stages            map[string]string // attempt -> stage id
+	stageDigest       map[string]string
+	uploadURL         string
+	accepts           int
 }
 
 func (f *fakeControl) GetInstance(ctx context.Context, req *controlv1.GetInstanceRequest) (*controlv1.GetInstanceResponse, error) {
@@ -112,6 +118,12 @@ func (f *fakeControl) GetInstance(ctx context.Context, req *controlv1.GetInstanc
 	}
 	if !f.noOperation {
 		resp.Operation = &controlv1.OperationView{OperationId: "op_1", TenantId: "tenant_a", Lifecycle: f.lifecycle, Control: f.control, ExecutionEpoch: f.opEpoch, Deadline: timestamppb.New(f.deadline.Add(time.Hour))}
+	}
+	if !f.operationDeadline.IsZero() && resp.Operation != nil {
+		resp.Operation.Deadline = timestamppb.New(f.operationDeadline)
+	}
+	if f.afterLookup != nil {
+		f.afterLookup()
 	}
 	return resp, nil
 }
@@ -760,4 +772,76 @@ func candidateProbes(dir, input string) {
 		}
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(rep)
+}
+
+// confirmedClient uses the same clock-passing boundary as app.resolver.
+type confirmedClient struct{ *scope.Client }
+
+func (c confirmedClient) Confirm(ctx context.Context, now func() time.Time, purpose scope.Purpose) (*scope.Scope, error) {
+	return c.Client.Confirm(ctx, scope.Binding{OperationID: "op_1", AttemptID: "att_1", ProfileID: "harness-wiring-dev-v1", LaunchKey: "cg-test", ExecutionEpoch: "1", LaunchEpoch: "1"}, now, purpose)
+}
+
+// Control advances a controlled clock while answering GetInstance. No sleep
+// or short scheduling window: both routes must sample after that answer.
+func TestLookupCrossingDeadlineServesNothing(t *testing.T) {
+	start := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	deadline := start.Add(time.Minute)
+	for _, operation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("operation=%v", operation), func(t *testing.T) {
+			var clock atomic.Int64
+			clock.Store(start.UnixNano())
+			fc := &fakeControl{registered: true, current: true, deadline: deadline,
+				attempt: controlv1.AttemptState_ATTEMPT_STATE_RUNNING, lifecycle: controlv1.Lifecycle_LIFECYCLE_RUNNING,
+				opEpoch: "1", atEpoch: "1", launchEpoch: "1"}
+			if operation {
+				fc.deadline = deadline.Add(time.Hour)
+				fc.operationDeadline = deadline
+			}
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			grpcServer := grpc.NewServer()
+			controlv1.RegisterExecutionServiceServer(grpcServer, fc)
+			go grpcServer.Serve(lis)
+			t.Cleanup(grpcServer.Stop)
+			client, err := scope.Dial(scope.Identity{Backend: "test-backend", LaunchKey: "cg-test", PodUID: "pod-1"}, scope.Options{Address: lis.Addr().String(), Timeout: 5 * time.Second})
+			require.NoError(t, err)
+			t.Cleanup(func() { client.Close() })
+			env, err := envelope.Parse([]byte(envelopeJSON))
+			require.NoError(t, err)
+			inputs := server.NewInputs(env)
+			require.NoError(t, inputs.Stage("fixed-input", []byte(fixedInput)))
+			srv := &server.Server{TrustedUID: 0, CandidateUID: candidateUID, Envelope: env, Inputs: inputs, Scope: confirmedClient{client}, Log: slog.Default(), Now: func() time.Time { return time.Unix(0, clock.Load()) }}
+			for _, candidate := range []bool{false, true} {
+				for _, crossed := range []bool{false, true} {
+					clock.Store(start.UnixNano())
+					fc.set(func(f *fakeControl) {
+						f.afterLookup = func() {
+							if crossed {
+								clock.Store(deadline.UnixNano())
+							}
+						}
+					})
+					path, uid, handler := "/v1/scope", uint32(0), srv.Trusted()
+					if candidate {
+						path, uid, handler = "/v1/inputs/fixed-input", candidateUID, srv.Candidate()
+					}
+					ctx := server.ConnContext(context.Background(), &sockets.Conn{Peer: sockets.Peer{UID: uid}})
+					req := httptest.NewRequest("GET", path, nil).WithContext(ctx)
+					resp := httptest.NewRecorder()
+					handler.ServeHTTP(resp, req)
+					if crossed {
+						require.Equal(t, http.StatusForbidden, resp.Code, resp.Body.String())
+						require.Contains(t, resp.Body.String(), "DEADLINE_EXCEEDED")
+						require.NotContains(t, resp.Body.String(), fixedInput)
+						require.NotContains(t, resp.Body.String(), "instanceId")
+					} else {
+						require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
+						if candidate {
+							require.Equal(t, fixedInput, resp.Body.String())
+						}
+					}
+				}
+			}
+		})
+	}
 }

@@ -282,13 +282,15 @@ func (c *Client) Lookup(ctx context.Context) (*Registration, error) {
 }
 
 // Confirm reads the registration now and decides its authority for the
-// purpose; the returned scope is usable only when the error is nil.
-func (c *Client) Confirm(ctx context.Context, b Binding, now time.Time, purpose Purpose) (*Scope, error) {
+// purpose. Read the clock after the lookup, immediately before deciding;
+// a request that crossed either deadline grants no authority. The returned
+// scope is usable only when the error is nil.
+func (c *Client) Confirm(ctx context.Context, b Binding, now func() time.Time, purpose Purpose) (*Scope, error) {
 	r, err := c.Lookup(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.Confirm(b, now, purpose); err != nil {
+	if err := r.Confirm(b, now(), purpose); err != nil {
 		return nil, err
 	}
 	return &r.Scope, nil
@@ -305,6 +307,7 @@ var classes = map[string]controlv1.ArtifactClass{
 	"prompt": controlv1.ArtifactClass_ARTIFACT_CLASS_PROMPT, "brief": controlv1.ArtifactClass_ARTIFACT_CLASS_BRIEF, "source": controlv1.ArtifactClass_ARTIFACT_CLASS_SOURCE,
 	"stage": controlv1.ArtifactClass_ARTIFACT_CLASS_STAGE, "result": controlv1.ArtifactClass_ARTIFACT_CLASS_RESULT, "evidence": controlv1.ArtifactClass_ARTIFACT_CLASS_EVIDENCE,
 	"answer": controlv1.ArtifactClass_ARTIFACT_CLASS_ANSWER, "argument": controlv1.ArtifactClass_ARTIFACT_CLASS_ARGUMENT,
+	"npm": controlv1.ArtifactClass_ARTIFACT_CLASS_NPM, "browser": controlv1.ArtifactClass_ARTIFACT_CLASS_BROWSER, "css": controlv1.ArtifactClass_ARTIFACT_CLASS_CSS,
 }
 
 // Transfer is the outcome of one scoped upload.
