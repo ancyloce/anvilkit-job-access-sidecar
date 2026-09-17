@@ -106,6 +106,8 @@ type ScopeSource interface {
 	Confirm(ctx context.Context, now func() time.Time, purpose scope.Purpose) (*scope.Scope, error)
 	Upload(ctx context.Context, s *scope.Scope, class, mediaType string, body []byte) (*scope.Transfer, error)
 	Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, observer string, manifest []byte) (*scope.Stage, error)
+	// AcceptedStage reads the accepted result of the attempt (nil when none).
+	AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.AcceptedStage, error)
 }
 
 // ModelRelay forwards one bound model request to the Model Proxy and copies
@@ -329,6 +331,24 @@ func (s *Server) Trusted() http.Handler {
 		st, err := s.Scope.Submit(r.Context(), sc, in.Verdict, in.FailureCode, in.ObserverIdentity, []byte(in.Manifest))
 		if err != nil {
 			s.answerActionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, st)
+	})
+	// The accepted stage of this attempt (P12 joint stage recovery): read
+	// under the same authority a result submission needs, never claimed.
+	mux.HandleFunc("GET /v1/results", func(w http.ResponseWriter, r *http.Request) {
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForResult)
+		if !s.answerScopeError(w, err) {
+			return
+		}
+		st, err := s.Scope.AcceptedStage(r.Context(), sc)
+		if err != nil {
+			s.answerActionError(w, err)
+			return
+		}
+		if st == nil {
+			fail(w, http.StatusNotFound, "NOT_FOUND", "no result is accepted for this attempt")
 			return
 		}
 		writeJSON(w, http.StatusOK, st)
