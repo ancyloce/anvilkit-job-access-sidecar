@@ -54,6 +54,10 @@ func (r *resolver) Submit(ctx context.Context, s *scope.Scope, verdict, failureC
 	return r.client.Submit(ctx, s, verdict, failureCode, observer, manifest)
 }
 
+func (r *resolver) AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.AcceptedStage, error) {
+	return r.client.AcceptedStage(ctx, s)
+}
+
 // Run serves until ctx ends. It refuses to run under any UID but the
 // configured owner and with a disabled identity.
 func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {

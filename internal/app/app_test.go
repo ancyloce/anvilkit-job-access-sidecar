@@ -168,6 +168,17 @@ func (f *fakeControl) FinalizeTransfer(ctx context.Context, req *controlv1.Final
 	return &controlv1.FinalizeTransferResponse{Transfer: t}, nil
 }
 
+func (f *fakeControl) GetAcceptedStage(ctx context.Context, req *controlv1.GetAcceptedStageRequest) (*controlv1.GetAcceptedStageResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.stages[req.GetAttemptId()]
+	if !ok {
+		return nil, status.Error(codes.NotFound, "NOT_FOUND: no accepted stage")
+	}
+	return &controlv1.GetAcceptedStageResponse{Stage: &controlv1.AcceptedStage{StageId: id, AttemptId: req.GetAttemptId(), InstanceId: "inst_1", Verdict: controlv1.Verdict_VERDICT_CERTIFIED, ResultDigest: f.stageDigest[req.GetAttemptId()], ExecutionEpoch: "1", RecoveryEpoch: "0",
+		Artifacts: []*controlv1.ArtifactReference{{Handle: "hdl_result", Class: "result", Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000", SizeBytes: "1", TransferId: "xfer_1", ObjectVersion: "v1"}}}}, nil
+}
+
 func (f *fakeControl) AcceptResult(ctx context.Context, req *controlv1.AcceptResultRequest) (*controlv1.AcceptResultResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -414,6 +425,11 @@ func TestTrustedFlow(t *testing.T) {
 	a = h.trusted("POST", "/v1/model/relay", nil, []byte("{}"))
 	require.Equal(t, 503, a.Status)
 
+	// No result is accepted yet: the accepted-stage read answers not found (P12 recovery reads Control first).
+	a = h.trusted("GET", "/v1/results", nil, nil)
+	require.Equal(t, 404, a.Status, string(a.Raw))
+	require.Equal(t, "NOT_FOUND", a.Code)
+
 	manifest := fmt.Sprintf(`{"schemaVersion":1,"launchId":"lch_1","attemptId":"att_1","jobKind":"codegen","profileId":"harness-wiring-dev-v1","verdict":"certified","outputs":[{"class":"result","digest":"%s","sizeBytes":"%d","handle":"%s"}],"completedAt":"2026-09-16T12:00:00Z"}`, resultDigest, len(result), handle)
 	submit := []byte(`{"verdict":"certified","observerIdentity":"test-observer","manifest":` + manifest + `}`)
 	a = h.trusted("POST", "/v1/results", map[string]string{"Content-Type": "application/json"}, submit)
@@ -424,6 +440,14 @@ func TestTrustedFlow(t *testing.T) {
 	require.Equal(t, 200, a.Status, "the attempt is result_accepted now; the same result reenters: %s", a.Raw)
 	require.Equal(t, "stg_1", a.Body["stageId"])
 	require.Equal(t, true, a.Body["existing"], "a duplicate submission reenters the stage")
+	// The accepted stage is readable under the result authority: identity, digest, epochs and bound artifacts, never a resend.
+	a = h.trusted("GET", "/v1/results", nil, nil)
+	require.Equal(t, 200, a.Status, string(a.Raw))
+	require.Equal(t, "stg_1", a.Body["stageId"])
+	require.Equal(t, "certified", a.Body["verdict"])
+	require.Equal(t, "1", a.Body["executionEpoch"])
+	require.Len(t, a.Body["artifacts"], 1)
+	require.Equal(t, 2, h.control.accepts, "reading the accepted stage submits nothing")
 	a = h.trusted("POST", "/v1/transfers", map[string]string{"X-Anvilkit-Class": "result", "Content-Type": "text/plain"}, []byte("late"))
 	require.Equal(t, 403, a.Status)
 	require.Equal(t, "STALE_EXECUTION", a.Code, "an accepted attempt admits no new transfer")
