@@ -425,6 +425,61 @@ type Stage struct {
 	Existing     bool   `json:"existing"`
 }
 
+// AcceptedStage is the accepted result of this attempt as Control records
+// it (P12 joint stage recovery): the stage identity, the verdict, the
+// digest of the accepted result manifest, the epochs it was accepted under
+// and every artifact it binds with its exact object version.
+type AcceptedStage struct {
+	StageID          string             `json:"stageId"`
+	AttemptID        string             `json:"attemptId"`
+	InstanceID       string             `json:"instanceId"`
+	Verdict          string             `json:"verdict"`
+	FailureCode      string             `json:"failureCode,omitempty"`
+	ResultDigest     string             `json:"resultDigest"`
+	ObserverIdentity string             `json:"observerIdentity"`
+	ProfileID        string             `json:"profileId"`
+	ExecutionEpoch   string             `json:"executionEpoch"`
+	RecoveryEpoch    string             `json:"recoveryEpoch"`
+	Artifacts        []AcceptedArtifact `json:"artifacts"`
+}
+
+type AcceptedArtifact struct {
+	Handle        string `json:"handle"`
+	Class         string `json:"class"`
+	Digest        string `json:"digest"`
+	SizeBytes     string `json:"sizeBytes"`
+	TransferID    string `json:"transferId"`
+	ObjectVersion string `json:"objectVersion"`
+}
+
+// AcceptedStage reads the accepted stage of the scope's attempt; nil when
+// no result is accepted yet. It never submits, resends or reopens anything.
+func (c *Client) AcceptedStage(ctx context.Context, s *Scope) (*AcceptedStage, error) {
+	ctx, cancel := c.call(ctx)
+	defer cancel()
+	resp, err := c.exec.GetAcceptedStage(ctx, &controlv1.GetAcceptedStageRequest{AttemptId: s.AttemptID, TenantId: s.TenantID})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, nil
+		}
+		return nil, refusal(err)
+	}
+	st := resp.GetStage()
+	if st == nil {
+		return nil, nil
+	}
+	out := &AcceptedStage{
+		StageID: st.GetStageId(), AttemptID: st.GetAttemptId(), InstanceID: st.GetInstanceId(),
+		Verdict: strings.ToLower(strings.TrimPrefix(st.GetVerdict().String(), "VERDICT_")), FailureCode: st.GetFailureCode(),
+		ResultDigest: st.GetResultDigest(), ObserverIdentity: st.GetObserverIdentity(), ProfileID: st.GetProfileId(),
+		ExecutionEpoch: st.GetExecutionEpoch(), RecoveryEpoch: st.GetRecoveryEpoch(), Artifacts: []AcceptedArtifact{},
+	}
+	for _, a := range st.GetArtifacts() {
+		out.Artifacts = append(out.Artifacts, AcceptedArtifact{Handle: a.GetHandle(), Class: a.GetClass(), Digest: a.GetDigest(), SizeBytes: a.GetSizeBytes(), TransferID: a.GetTransferId(), ObjectVersion: a.GetObjectVersion()})
+	}
+	return out, nil
+}
+
 // Submit submits the trusted observer's result manifest for acceptance
 // under the current instance and execution epoch: one result per attempt,
 // a repeat of the same bytes reenters the original stage, Control refuses
