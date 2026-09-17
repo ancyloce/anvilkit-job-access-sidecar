@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
@@ -107,12 +108,19 @@ type ScopeSource interface {
 	Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, observer string, manifest []byte) (*scope.Stage, error)
 }
 
+// ModelRelay forwards one bound model request to the Model Proxy and copies
+// the answer to w; nil when no Proxy is configured (P11).
+type ModelRelay interface {
+	Forward(ctx context.Context, w http.ResponseWriter, req modelproxyapi.ModelCallRequest, deadline time.Time) error
+}
+
 type Server struct {
 	TrustedUID   uint32
 	CandidateUID uint32
 	Envelope     Envelope
 	Inputs       *Inputs
 	Scope        ScopeSource
+	Relay        ModelRelay
 	Limits       Limits
 	Log          *slog.Logger
 	Now          func() time.Time
@@ -198,18 +206,50 @@ func (s *Server) Candidate() http.Handler {
 		w.Header().Set("Connection", "close")
 		_, _ = w.Write(b)
 	})
-	mux.HandleFunc("POST /v1/model/relay", func(w http.ResponseWriter, r *http.Request) {
-		// The controlled model relay is the candidate's only outbound
-		// route. Its upstream (Model Proxy, P11) is not configured in this
-		// unit: the route exists and answers that the dependency is
-		// unavailable; there is no direct provider or network fallback.
-		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
-		fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "model relay upstream not configured (P11)")
-	})
+	// The controlled model relay is the candidate's only outbound route:
+	// the Model Proxy through this process, under the scope Control
+	// confirms now; there is no direct provider or network fallback.
+	mux.HandleFunc("POST /v1/model/relay", s.modelRelay)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "ROUTE_FORBIDDEN", "")
 	})
 	return s.guard(s.CandidateUID, mux)
+}
+
+// modelRelay binds the caller's request to the confirmed scope and forwards
+// it (P11): the caller states the call identity, route, content and bounds;
+// the binding, the identity presented to the Proxy and the deadline bound
+// are this process's. Without a configured Proxy the route answers that the
+// dependency is unavailable.
+func (s *Server) modelRelay(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.Limits.MaxInputBytes))
+	if err != nil {
+		fail(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "")
+		return
+	}
+	if s.Relay == nil {
+		fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "model relay upstream not configured (P11)")
+		return
+	}
+	req, err := scope.ParseRelayRequest(raw)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", "callId, routeId, messages, maxOutputTokens and maxExposure only: "+err.Error())
+		return
+	}
+	sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
+	if !s.answerScopeError(w, err) {
+		return
+	}
+	bound, err := scope.Bind(sc, req, raw)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	deadline, _ := time.Parse(time.RFC3339Nano, bound.Deadline)
+	if err := s.Relay.Forward(r.Context(), w, bound, deadline); err != nil {
+		s.Log.Warn("model relay failed", "callId", req.CallID, "error", err.Error())
+		fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "model proxy unreachable")
+	}
 }
 
 // Trusted is the trusted route set.
@@ -302,9 +342,10 @@ func (s *Server) Trusted() http.Handler {
 			fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", dep+" upstream not configured")
 		}
 	}
-	// Trusted expert relays: reserved for the trusted harness (P12/P16/P19
-	// wire their upstreams); they never exist on the candidate socket.
-	mux.HandleFunc("POST /v1/model/relay", unavailable("model relay (P11)"))
+	// The trusted harness reaches the same controlled model relay; the
+	// Knowledge and MCP expert relays are reserved for their units
+	// (P16/P19) and never exist on the candidate socket.
+	mux.HandleFunc("POST /v1/model/relay", s.modelRelay)
 	mux.HandleFunc("POST /v1/knowledge/", unavailable("knowledge (P16)"))
 	mux.HandleFunc("POST /v1/mcp/", unavailable("mcp (P19)"))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
