@@ -3,7 +3,7 @@ module github.com/ancyloce/anvilkit-job-access-sidecar
 go 1.26.8
 
 require (
-	github.com/ancyloce/anvilkit-agent-contracts/go v0.1.2-0.20260916181159-a397fee37c16
+	github.com/ancyloce/anvilkit-agent-contracts/go v0.1.2
 	github.com/go-viper/mapstructure/v2 v2.4.0
 	github.com/knadh/koanf/parsers/yaml v1.1.0
 	github.com/knadh/koanf/providers/confmap v1.0.0

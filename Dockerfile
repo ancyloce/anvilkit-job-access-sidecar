@@ -1,10 +1,8 @@
 # anvilkit-job-access-sidecar: the trusted access sidecar of a Job Pod
 # (DD-03 §5). Built from this repository alone; the generated contract
 # module is an ordinary versioned dependency resolved through GOPROXY (the
-# pseudo-version of the pushed contracts commit that carries
-# ExecutionService.GetInstance and its operation view, until a tag exists).
-# The parent checkout's deploy/dev/images.sh builds the development image
-# against its contracts checkout instead (DEVELOPMENT_ONLY).
+# declared version in go.mod). The parent's deploy/dev/images.sh uses this
+# same standalone build, without a workspace replacement.
 FROM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG GONOSUMDB=
