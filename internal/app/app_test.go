@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	controlv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/control/v1"
+	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/app"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/config"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
@@ -226,6 +227,11 @@ const fixedInput = "anvilkit-codegen-fixed-v1 input\n"
 // 10002 with supplementary groups 0 and 10001 in a world-traversable
 // directory (go test's build directory is not).
 func start(t *testing.T, registered, current bool, deadline time.Time) *harness {
+	return startWith(t, registered, current, deadline, nil)
+}
+
+// startWith is start with additional sidecar environment (the model relay placement).
+func startWith(t *testing.T, registered, current bool, deadline time.Time, extraEnv []string) *harness {
 	t.Helper()
 	if os.Geteuid() != 0 {
 		t.Skip("the sidecar tests spawn processes under other UIDs and need root")
@@ -276,6 +282,7 @@ func start(t *testing.T, registered, current bool, deadline time.Time) *harness 
 	cmd := exec.Command(helper)
 	cmd.Env = []string{"SIDECAR_HELPER=serve", "ANVILKIT_SIDECAR_CONFIG=" + cfgPath, "ANVILKIT_SIDECAR_CONTROL_ADDRESS=" + h.controlAddr,
 		"ANVILKIT_SIDECAR_SOCKETS_DIR=" + h.dir, "ANVILKIT_SIDECAR_BACKEND=test-backend", "ANVILKIT_SIDECAR_LAUNCH_KEY=cg-test", "ANVILKIT_SIDECAR_POD_UID=pod-1", "ANVILKIT_SIDECAR_LAUNCH_ENVELOPE=" + envelopeJSON}
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: sidecarUID, Gid: sidecarUID, Groups: []uint32{0, candidateUID}}}
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
@@ -755,6 +762,8 @@ func candidateProbes(dir, input string) {
 	ask("candidate:transfers", "POST", "/v1/transfers", "x")
 	ask("candidate:knowledge", "POST", "/v1/knowledge/search", "{}")
 	ask("candidate:model-relay", "POST", "/v1/model/relay", "{}")
+	rep["candidate:model-relay-frames"] = string(ask("candidate:model-relay-bound", "POST", "/v1/model/relay", relayBody))
+	ask("candidate:model-relay-binding", "POST", "/v1/model/relay", `{"callId":"call_c","routeId":"controlled-openai-v1","messages":[{"role":"user","content":"x"}],"maxOutputTokens":16,"maxExposure":{"currency":"USD","amount":"10"},"binding":{"tenantId":"tenant_b","operationId":"op_x","attemptId":"att_x","executionEpoch":"9"}}`)
 	uc, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
 	if err != nil {
 		rep["candidate:fd-delegation"] = errString(err)
@@ -773,6 +782,130 @@ func candidateProbes(dir, input string) {
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(rep)
 }
+
+// relayBody is a valid relay request of the candidate probes.
+const relayBody = `{"callId":"call_c","routeId":"controlled-openai-v1","messages":[{"role":"user","content":"Plan."}],"maxOutputTokens":16,"maxExposure":{"currency":"USD","amount":"10"}}`
+
+// fakeProxy is a Model Proxy double of the frozen transport: it records the
+// forwarded request and answers scripted frames.
+type fakeProxy struct {
+	srv   *httptest.Server
+	mu    sync.Mutex
+	posts []struct {
+		Auth string
+		Body []byte
+	}
+}
+
+func newFakeProxy(t *testing.T) *fakeProxy {
+	f := &fakeProxy{}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/model-calls" {
+			w.WriteHeader(404)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.posts = append(f.posts, struct {
+			Auth string
+			Body []byte
+		}{r.Header.Get("Authorization"), raw})
+		f.mu.Unlock()
+		var req modelproxyapi.ModelCallRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl := w.(http.Flusher)
+		for i, fr := range []string{`{"callId":%q,"sequence":"0","type":"admitted"}`, `{"callId":%q,"sequence":"1","type":"text","text":"relayed"}`, `{"callId":%q,"sequence":"2","type":"done","outcome":"succeeded","usage":{"inputUnits":"3","outputUnits":"1","reasoningUnits":"0","cachedInputUnits":"0"}}`} {
+			fmt.Fprintf(w, "id: %d\ndata: "+fr+"\n\n", i, req.CallId)
+			fl.Flush()
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+// The model relay (P11): the execution binding is the confirmed scope, the
+// caller's bytes are forwarded under the sidecar's identity, the Proxy's
+// frames come back as they are, and a caller-supplied binding is refused.
+func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
+	proxy := newFakeProxy(t)
+	deadline := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	h := startWith(t, true, true, deadline, []string{"ANVILKIT_SIDECAR_MODEL_PROXY_URL=" + proxy.srv.URL, "ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN=sidecar-token"})
+	require.Eventually(t, func() bool { return h.trusted("GET", "/v1/scope", nil, nil).Status == 200 }, 10*time.Second, 100*time.Millisecond)
+	a := h.trusted("POST", "/v1/model/relay", map[string]string{"Authorization": "Bearer candidate-supplied", "Content-Type": "application/json"}, []byte(relayBody))
+	require.Equal(t, 200, a.Status, string(a.Raw))
+	require.Contains(t, string(a.Raw), `"type":"text","text":"relayed"`)
+	require.Contains(t, string(a.Raw), `"sequence":"2","type":"done"`)
+	require.Len(t, proxy.posts, 1)
+	require.Equal(t, "Bearer sidecar-token", proxy.posts[0].Auth, "the sidecar presents its own identity, never the caller's header")
+	var forwarded modelproxyapi.ModelCallRequest
+	require.NoError(t, json.Unmarshal(proxy.posts[0].Body, &forwarded))
+	require.Equal(t, "call_c", forwarded.CallId)
+	require.Equal(t, "controlled-openai-v1", forwarded.RouteId)
+	require.Equal(t, modelproxyapi.ExecutionBinding{TenantId: "tenant_a", OperationId: "op_1", AttemptId: "att_1", InstanceId: ptr("inst_1"), ExecutionEpoch: "1"}, forwarded.Binding, "the binding is the confirmed scope")
+	require.Equal(t, deadline.Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z"), forwarded.Deadline, "the attempt deadline bounds the call")
+	sc := &scope.Scope{TenantID: "tenant_a", OperationID: "op_1", AttemptID: "att_1", InstanceID: "inst_1", ExecutionEpoch: "1", Deadline: deadline}
+	parsed, err := scope.ParseRelayRequest([]byte(relayBody))
+	require.NoError(t, err)
+	expected, err := scope.Bind(sc, parsed, []byte(relayBody))
+	require.NoError(t, err)
+	require.Equal(t, expected.RequestDigest, forwarded.RequestDigest, "the digest binds the scope and the caller's exact bytes")
+
+	// A repeat of the same bytes forwards the same request (the Proxy
+	// answers the recorded call); changed bytes change the digest.
+	again := h.trusted("POST", "/v1/model/relay", map[string]string{"Content-Type": "application/json"}, []byte(relayBody))
+	require.Equal(t, 200, again.Status)
+	require.Len(t, proxy.posts, 2)
+	require.Equal(t, proxy.posts[0].Body, proxy.posts[1].Body)
+	changed := h.trusted("POST", "/v1/model/relay", nil, []byte(strings.Replace(relayBody, "Plan.", "Plan!", 1)))
+	require.Equal(t, 200, changed.Status)
+	var third modelproxyapi.ModelCallRequest
+	require.NoError(t, json.Unmarshal(proxy.posts[2].Body, &third))
+	require.NotEqual(t, forwarded.RequestDigest, third.RequestDigest)
+
+	for name, body := range map[string]string{
+		"a binding":        `{"callId":"c","routeId":"r","messages":[{"role":"user","content":"x"}],"maxOutputTokens":1,"maxExposure":{"currency":"USD","amount":"1"},"binding":{"tenantId":"tenant_b","operationId":"o","attemptId":"a","executionEpoch":"9"}}`,
+		"a provider key":   `{"callId":"c","routeId":"r","messages":[{"role":"user","content":"x"}],"maxOutputTokens":1,"maxExposure":{"currency":"USD","amount":"1"},"apiKey":"sk-x"}`,
+		"a request digest": `{"callId":"c","routeId":"r","messages":[{"role":"user","content":"x"}],"maxOutputTokens":1,"maxExposure":{"currency":"USD","amount":"1"},"requestDigest":"sha256:00"}`,
+		"an empty object":  `{}`,
+	} {
+		bad := h.trusted("POST", "/v1/model/relay", nil, []byte(body))
+		require.Equal(t, 400, bad.Status, name)
+		require.Equal(t, "INVALID_ARGUMENT", bad.Code, name)
+	}
+	require.Len(t, proxy.posts, 3, "refused requests never reach the Proxy")
+
+	// The candidate socket relays under the same binding; its own binding is refused.
+	cmd := exec.Command(h.helper)
+	cmd.Env = []string{"SIDECAR_HELPER=candidate", "SIDECAR_DIR=" + h.dir, "SIDECAR_INPUT=fixed-input"}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: candidateUID, Gid: candidateUID, Groups: []uint32{}}}
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	var rep map[string]string
+	require.NoError(t, json.Unmarshal(out, &rep), string(out))
+	require.Equal(t, "400 INVALID_ARGUMENT", rep["candidate:model-relay"], "an empty relay request")
+	require.Equal(t, "200 ", rep["candidate:model-relay-bound"])
+	require.Contains(t, rep["candidate:model-relay-frames"], `"text":"relayed"`)
+	require.Equal(t, "400 INVALID_ARGUMENT", rep["candidate:model-relay-binding"], "a candidate cannot name its own binding")
+	require.Len(t, proxy.posts, 4)
+	var fromCandidate modelproxyapi.ModelCallRequest
+	require.NoError(t, json.Unmarshal(proxy.posts[3].Body, &fromCandidate))
+	require.Equal(t, forwarded.Binding, fromCandidate.Binding)
+	require.Equal(t, "Bearer sidecar-token", proxy.posts[3].Auth)
+
+	// A closed attempt ends the relay with the scope.
+	h.control.set(func(f *fakeControl) { f.attempt = controlv1.AttemptState_ATTEMPT_STATE_CLOSED })
+	stale := h.trusted("POST", "/v1/model/relay", nil, []byte(relayBody))
+	require.Equal(t, 403, stale.Status)
+	require.Equal(t, "STALE_EXECUTION", stale.Code)
+	require.Len(t, proxy.posts, 4)
+}
+
+func ptr(s string) *string { return &s }
 
 // confirmedClient uses the same clock-passing boundary as app.resolver.
 type confirmedClient struct{ *scope.Client }

@@ -94,8 +94,24 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	var relay server.ModelRelay
+	if cfg.ModelProxy.URL != "" {
+		o := scope.RelayOptions{URL: cfg.ModelProxy.URL, Timeout: cfg.ModelProxy.Timeout}
+		if tlsFiles != nil {
+			o.TLS = tlsFiles
+		} else {
+			o.Token = cfg.ModelProxy.Token
+		}
+		r, err := scope.NewRelay(o)
+		if err != nil {
+			return fmt.Errorf("model relay: %w", err)
+		}
+		relay = r
+	} else {
+		log.Warn("model proxy url not configured; the model relay answers DEPENDENCY_UNAVAILABLE")
+	}
 	srv := &server.Server{
-		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res,
+		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay,
 		Limits: server.Limits{MaxInputBytes: cfg.Limits.MaxInputBytes, MaxTransferBytes: cfg.Limits.MaxTransferBytes, MaxManifestBytes: cfg.Limits.MaxManifestBytes, RequestTimeout: cfg.Limits.RequestTimeout},
 		Log:    log, Now: time.Now,
 	}
@@ -103,7 +119,7 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	errs := make(chan error, 2)
 	go func() { errs <- trusted.Serve(layout.Trusted) }()
 	go func() { errs <- candidate.Serve(layout.Candidate) }()
-	log.Info("access sidecar serving", "dir", layout.Dir, "launchKey", cfg.Launch.LaunchKey, "backend", cfg.Launch.Backend, "identity", cfg.Identity.Mode)
+	log.Info("access sidecar serving", "dir", layout.Dir, "launchKey", cfg.Launch.LaunchKey, "backend", cfg.Launch.Backend, "identity", cfg.Identity.Mode, "modelRelay", relay != nil)
 
 	select {
 	case <-ctx.Done():
