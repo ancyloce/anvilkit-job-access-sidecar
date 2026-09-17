@@ -464,20 +464,7 @@ func (c *Client) AcceptedStage(ctx context.Context, s *Scope) (*AcceptedStage, e
 		}
 		return nil, refusal(err)
 	}
-	st := resp.GetStage()
-	if st == nil {
-		return nil, nil
-	}
-	out := &AcceptedStage{
-		StageID: st.GetStageId(), AttemptID: st.GetAttemptId(), InstanceID: st.GetInstanceId(),
-		Verdict: strings.ToLower(strings.TrimPrefix(st.GetVerdict().String(), "VERDICT_")), FailureCode: st.GetFailureCode(),
-		ResultDigest: st.GetResultDigest(), ObserverIdentity: st.GetObserverIdentity(), ProfileID: st.GetProfileId(),
-		ExecutionEpoch: st.GetExecutionEpoch(), RecoveryEpoch: st.GetRecoveryEpoch(), Artifacts: []AcceptedArtifact{},
-	}
-	for _, a := range st.GetArtifacts() {
-		out.Artifacts = append(out.Artifacts, AcceptedArtifact{Handle: a.GetHandle(), Class: a.GetClass(), Digest: a.GetDigest(), SizeBytes: a.GetSizeBytes(), TransferID: a.GetTransferId(), ObjectVersion: a.GetObjectVersion()})
-	}
-	return out, nil
+	return fromAcceptedStage(resp.GetStage()), nil
 }
 
 // Submit submits the trusted observer's result manifest for acceptance
@@ -505,4 +492,99 @@ func (c *Client) Submit(ctx context.Context, s *Scope, verdict, failureCode, obs
 		return nil, refusal(err)
 	}
 	return &Stage{StageID: resp.GetStage().GetStageId(), ResultDigest: resp.GetStage().GetResultDigest(), Existing: resp.GetExisting()}, nil
+}
+
+// PriorStage reads the accepted stage of another attempt of the scope's
+// operation (P13-04 cross-attempt recovery): Control checks the
+// relationship (the stage belongs to an attempt of this operation and
+// tenant); nil when that attempt has no accepted stage. Nothing is
+// resent or reopened.
+func (c *Client) PriorStage(ctx context.Context, s *Scope, attemptID string) (*AcceptedStage, error) {
+	ctx, cancel := c.call(ctx)
+	defer cancel()
+	resp, err := c.exec.GetAcceptedStage(ctx, &controlv1.GetAcceptedStageRequest{AttemptId: attemptID, TenantId: s.TenantID, OperationId: s.OperationID})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, nil
+		}
+		return nil, refusal(err)
+	}
+	return fromAcceptedStage(resp.GetStage()), nil
+}
+
+func fromAcceptedStage(st *controlv1.AcceptedStage) *AcceptedStage {
+	if st == nil {
+		return nil
+	}
+	out := &AcceptedStage{
+		StageID: st.GetStageId(), AttemptID: st.GetAttemptId(), InstanceID: st.GetInstanceId(),
+		Verdict: strings.ToLower(strings.TrimPrefix(st.GetVerdict().String(), "VERDICT_")), FailureCode: st.GetFailureCode(),
+		ResultDigest: st.GetResultDigest(), ObserverIdentity: st.GetObserverIdentity(), ProfileID: st.GetProfileId(),
+		ExecutionEpoch: st.GetExecutionEpoch(), RecoveryEpoch: st.GetRecoveryEpoch(), Artifacts: []AcceptedArtifact{},
+	}
+	for _, a := range st.GetArtifacts() {
+		out.Artifacts = append(out.Artifacts, AcceptedArtifact{Handle: a.GetHandle(), Class: a.GetClass(), Digest: a.GetDigest(), SizeBytes: a.GetSizeBytes(), TransferID: a.GetTransferId(), ObjectVersion: a.GetObjectVersion()})
+	}
+	return out
+}
+
+// Loaded is an artifact read through Control under the scope.
+type Loaded struct {
+	Handle    string
+	Class     string
+	Digest    string
+	SizeBytes int64
+	Bytes     []byte
+}
+
+// Load reads the artifact a launch input names by handle (P13-04):
+// Control issues the scoped download capability only under an authorized
+// relationship between this instance's operation and the artifact (its
+// brief, an accepted stage of one of its attempts) while the instance is
+// the current one of an executing attempt; the bytes are fetched through
+// the capability and verified against the digest and size Control
+// answered before anything is staged. maxBytes bounds the read. The
+// capability never leaves this process.
+func (c *Client) Load(ctx context.Context, s *Scope, handle string, maxBytes int64) (*Loaded, error) {
+	rctx, cancel := c.call(ctx)
+	resp, err := c.artifact.ReadArtifact(rctx, &controlv1.ReadArtifactRequest{Handle: handle, OperationId: s.OperationID, InstanceId: s.InstanceID})
+	cancel()
+	if err != nil {
+		return nil, refusal(err)
+	}
+	t := resp.GetTransfer()
+	size, err := strconv.ParseInt(t.GetExpectedSize(), 10, 64)
+	if err != nil || size < 0 {
+		return nil, fmt.Errorf("%w: transfer %s declares size %q", ErrUnavailable, t.GetTransferId(), t.GetExpectedSize())
+	}
+	if maxBytes > 0 && size > maxBytes {
+		return nil, fmt.Errorf("%w: INVALID_ARGUMENT artifact %s holds %d bytes, the input bound is %d", ErrRefused, handle, size, maxBytes)
+	}
+	cap := resp.GetDownload()
+	if cap == nil || cap.GetUrl() == "" {
+		return nil, fmt.Errorf("%w: no download capability was issued", ErrUnavailable)
+	}
+	req, err := http.NewRequestWithContext(ctx, cap.GetMethod(), cap.GetUrl(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: download request: %v", ErrUnavailable, err)
+	}
+	for k, v := range cap.GetHeaders() {
+		req.Header.Set(k, v)
+	}
+	res, err := c.upload.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: download: transport error", ErrUnavailable)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: download answered %d", ErrUnavailable, res.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, size+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: download: transport error", ErrUnavailable)
+	}
+	if int64(len(body)) != size || DigestOf(body) != t.GetExpectedDigest() {
+		return nil, fmt.Errorf("%w: STALE_EXECUTION artifact %s: the downloaded bytes (%d, %s) are not the recorded object (%s, %s)", ErrRefused, handle, len(body), DigestOf(body), t.GetExpectedSize(), t.GetExpectedDigest())
+	}
+	return &Loaded{Handle: t.GetHandle(), Class: strings.ToLower(strings.TrimPrefix(t.GetClass().String(), "ARTIFACT_CLASS_")), Digest: t.GetExpectedDigest(), SizeBytes: size, Bytes: body}, nil
 }

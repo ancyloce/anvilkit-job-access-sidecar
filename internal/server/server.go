@@ -36,19 +36,32 @@ import (
 type Envelope = envelope.Envelope
 
 // Inputs holds the permitted inputs the trusted harness staged, each
-// verified against the digest the envelope declares for its name.
+// verified against the digest the envelope declares for its name, and the
+// handles the envelope binds to names (an input loaded through Control).
 type Inputs struct {
 	mu       sync.RWMutex
 	declared map[string]string
+	handles  map[string]string
 	bytes    map[string][]byte
 }
 
 func NewInputs(env Envelope) *Inputs {
-	in := &Inputs{declared: map[string]string{}, bytes: map[string][]byte{}}
+	in := &Inputs{declared: map[string]string{}, handles: map[string]string{}, bytes: map[string][]byte{}}
 	for _, i := range env.Inputs {
 		in.declared[i.Name] = i.Digest
+		if i.Handle != "" {
+			in.handles[i.Name] = i.Handle
+		}
 	}
 	return in
+}
+
+// Handle is the artifact handle the envelope binds to the input name.
+func (in *Inputs) Handle(name string) (string, bool) {
+	in.mu.RLock()
+	defer in.mu.RUnlock()
+	h, ok := in.handles[name]
+	return h, ok
 }
 
 // Names lists the permitted input names.
@@ -108,6 +121,12 @@ type ScopeSource interface {
 	Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, observer string, manifest []byte) (*scope.Stage, error)
 	// AcceptedStage reads the accepted result of the attempt (nil when none).
 	AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.AcceptedStage, error)
+	// PriorStage reads the accepted stage of another attempt of the scope's
+	// operation (nil when none); Control checks the relationship.
+	PriorStage(ctx context.Context, s *scope.Scope, attemptID string) (*scope.AcceptedStage, error)
+	// Load reads an artifact by handle under the scope's authority and
+	// verifies its bytes against Control's record.
+	Load(ctx context.Context, s *scope.Scope, handle string, maxBytes int64) (*scope.Loaded, error)
 }
 
 // ModelRelay forwards one bound model request to the Model Proxy and copies
@@ -183,7 +202,10 @@ func (s *Server) guard(uid uint32, next http.Handler) http.Handler {
 	})
 }
 
-var inputName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+var (
+	inputName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+)
 
 // Candidate is the candidate route set.
 func (s *Server) Candidate() http.Handler {
@@ -264,6 +286,26 @@ func (s *Server) Trusted() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"scope": sc, "launchId": s.Envelope.LaunchID, "inputs": s.Inputs.Names()})
 	})
+	// The trusted harness reads staged bytes back (an input the sidecar
+	// loaded through Control) under the same authority as the candidate.
+	mux.HandleFunc("GET /v1/inputs/{name}", func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if !inputName.MatchString(name) {
+			fail(w, http.StatusNotFound, "NOT_FOUND", "")
+			return
+		}
+		if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
+			return
+		}
+		b, ok := s.Inputs.Get(name)
+		if !ok {
+			fail(w, http.StatusNotFound, "NOT_FOUND", "")
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Connection", "close")
+		_, _ = w.Write(b)
+	})
 	mux.HandleFunc("PUT /v1/inputs/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.Limits.MaxInputBytes))
@@ -279,6 +321,58 @@ func (s *Server) Trusted() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"name": name, "sizeBytes": len(body)})
+	})
+	// An input the envelope binds to an artifact handle is loaded through
+	// Control (P13-04): the scoped download capability is issued only under
+	// the authorized relationship of this instance's operation to the
+	// artifact, the bytes are verified against Control's record and then
+	// against the envelope's digest; the candidate reads the staged bytes
+	// and never sees a handle, key or capability.
+	mux.HandleFunc("POST /v1/inputs/{name}/loads", func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
+		handle, ok := s.Inputs.Handle(name)
+		if !inputName.MatchString(name) || !ok {
+			fail(w, http.StatusNotFound, "NOT_FOUND", "the envelope binds no handle to this input")
+			return
+		}
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
+		if !s.answerScopeError(w, err) {
+			return
+		}
+		loaded, err := s.Scope.Load(r.Context(), sc, handle, s.Limits.MaxInputBytes)
+		if err != nil {
+			s.answerActionError(w, err)
+			return
+		}
+		if err := s.Inputs.Stage(name, loaded.Bytes); err != nil {
+			fail(w, http.StatusBadRequest, "INPUT_REJECTED", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"name": name, "class": loaded.Class, "digest": loaded.Digest, "sizeBytes": loaded.SizeBytes})
+	})
+	// The accepted stage of another attempt of this operation (P13-04
+	// cross-attempt recovery): the relationship is Control's decision.
+	mux.HandleFunc("GET /v1/stages/{attemptId}", func(w http.ResponseWriter, r *http.Request) {
+		attemptID := r.PathValue("attemptId")
+		if !idPattern.MatchString(attemptID) {
+			fail(w, http.StatusNotFound, "NOT_FOUND", "")
+			return
+		}
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForResult)
+		if !s.answerScopeError(w, err) {
+			return
+		}
+		st, err := s.Scope.PriorStage(r.Context(), sc, attemptID)
+		if err != nil {
+			s.answerActionError(w, err)
+			return
+		}
+		if st == nil {
+			fail(w, http.StatusNotFound, "NOT_FOUND", "no accepted stage of that attempt belongs to this operation")
+			return
+		}
+		writeJSON(w, http.StatusOK, st)
 	})
 	mux.HandleFunc("POST /v1/transfers", func(w http.ResponseWriter, r *http.Request) {
 		class := r.Header.Get("X-Anvilkit-Class")

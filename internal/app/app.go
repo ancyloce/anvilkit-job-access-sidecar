@@ -58,6 +58,14 @@ func (r *resolver) AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.Ac
 	return r.client.AcceptedStage(ctx, s)
 }
 
+func (r *resolver) PriorStage(ctx context.Context, s *scope.Scope, attemptID string) (*scope.AcceptedStage, error) {
+	return r.client.PriorStage(ctx, s, attemptID)
+}
+
+func (r *resolver) Load(ctx context.Context, s *scope.Scope, handle string, maxBytes int64) (*scope.Loaded, error) {
+	return r.client.Load(ctx, s, handle, maxBytes)
+}
+
 // Run serves until ctx ends. It refuses to run under any UID but the
 // configured owner and with a disabled identity.
 func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
