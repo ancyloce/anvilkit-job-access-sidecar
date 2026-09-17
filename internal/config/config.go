@@ -13,6 +13,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -81,6 +82,17 @@ type Launch struct {
 	Envelope  string `koanf:"envelope"`
 }
 
+// ModelProxy is the Model Proxy placement of the controlled model relay
+// (P11): the URL and the identity the sidecar presents — the
+// DEVELOPMENT_ONLY bearer token from ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN under
+// identity.mode development, the workload certificate files under mtls.
+// Without a URL the relay answers DEPENDENCY_UNAVAILABLE.
+type ModelProxy struct {
+	URL     string        `koanf:"url"`
+	Token   string        `koanf:"token"`
+	Timeout time.Duration `koanf:"timeout"`
+}
+
 type Limits struct {
 	MaxInputBytes    int64         `koanf:"max_input_bytes"`
 	MaxTransferBytes int64         `koanf:"max_transfer_bytes"`
@@ -94,6 +106,7 @@ type Config struct {
 	Control         Control       `koanf:"control"`
 	Identity        Identity      `koanf:"identity"`
 	Launch          Launch        `koanf:"launch"`
+	ModelProxy      ModelProxy    `koanf:"model_proxy"`
 	Limits          Limits        `koanf:"limits"`
 	ShutdownTimeout time.Duration `koanf:"shutdown_timeout"`
 }
@@ -105,6 +118,7 @@ var defaults = map[string]any{
 	"sockets.owner_uid":         10002,
 	"control.timeout":           "15s",
 	"identity.mode":             IdentityDisabled,
+	"model_proxy.timeout":       "5m",
 	"limits.max_input_bytes":    1 << 20,
 	"limits.max_transfer_bytes": 64 << 20,
 	"limits.max_manifest_bytes": 16384,
@@ -115,13 +129,15 @@ var defaults = map[string]any{
 
 // envOverrides is the complete set of accepted environment variables.
 var envOverrides = map[string]string{
-	"ANVILKIT_SIDECAR_CONTROL_ADDRESS": "control.address",
-	"ANVILKIT_SIDECAR_IDENTITY_MODE":   "identity.mode",
-	"ANVILKIT_SIDECAR_SOCKETS_DIR":     "sockets.dir",
-	"ANVILKIT_SIDECAR_BACKEND":         "launch.backend",
-	"ANVILKIT_SIDECAR_LAUNCH_KEY":      "launch.launch_key",
-	"ANVILKIT_SIDECAR_POD_UID":         "launch.pod_uid",
-	"ANVILKIT_SIDECAR_LAUNCH_ENVELOPE": "launch.envelope",
+	"ANVILKIT_SIDECAR_CONTROL_ADDRESS":   "control.address",
+	"ANVILKIT_SIDECAR_IDENTITY_MODE":     "identity.mode",
+	"ANVILKIT_SIDECAR_SOCKETS_DIR":       "sockets.dir",
+	"ANVILKIT_SIDECAR_BACKEND":           "launch.backend",
+	"ANVILKIT_SIDECAR_LAUNCH_KEY":        "launch.launch_key",
+	"ANVILKIT_SIDECAR_POD_UID":           "launch.pod_uid",
+	"ANVILKIT_SIDECAR_LAUNCH_ENVELOPE":   "launch.envelope",
+	"ANVILKIT_SIDECAR_MODEL_PROXY_URL":   "model_proxy.url",
+	"ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN": "model_proxy.token",
 }
 
 var launchKeyPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
@@ -146,6 +162,11 @@ func LoadFrom(path string, environ []string) (Config, error) {
 	for _, key := range []string{"launch.backend", "launch.launch_key", "launch.pod_uid", "launch.envelope"} {
 		if k.Exists(key) {
 			return Config{}, fmt.Errorf("config file %s: %s is a per-Job launch fact and is supplied only through the environment", path, key)
+		}
+	}
+	for _, key := range []string{"model_proxy.url", "model_proxy.token"} {
+		if k.Exists(key) {
+			return Config{}, fmt.Errorf("config file %s: %s is a deployment placement or a secret and is supplied only through the environment", path, key)
 		}
 	}
 	if err := applyEnv(k, environ); err != nil {
@@ -218,6 +239,17 @@ func (c Config) validate() error {
 		}
 	default:
 		errs = append(errs, fmt.Errorf("identity.mode %q is not one of disabled, development, mtls", c.Identity.Mode))
+	}
+	if c.ModelProxy.URL != "" {
+		if u, err := url.Parse(c.ModelProxy.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+			errs = append(errs, errors.New("ANVILKIT_SIDECAR_MODEL_PROXY_URL (model_proxy.url) must be an absolute http(s) URL without credentials"))
+		}
+		if c.Identity.Mode == IdentityDevelopment && c.ModelProxy.Token == "" {
+			errs = append(errs, errors.New("ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN (model_proxy.token) is required with a model proxy url under identity.mode development"))
+		}
+	}
+	if c.ModelProxy.Timeout < time.Second || c.ModelProxy.Timeout > time.Hour {
+		errs = append(errs, fmt.Errorf("model_proxy.timeout %s outside [1s, 1h]", c.ModelProxy.Timeout))
 	}
 	if c.Control.Timeout < time.Second || c.Control.Timeout > 5*time.Minute {
 		errs = append(errs, fmt.Errorf("control.timeout %s outside [1s, 5m]", c.Control.Timeout))
