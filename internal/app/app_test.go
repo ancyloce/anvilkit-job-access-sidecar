@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tmaxmax/go-sse"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -820,7 +822,9 @@ func newFakeProxy(t *testing.T) *fakeProxy {
 		w.WriteHeader(200)
 		fl := w.(http.Flusher)
 		for i, fr := range []string{`{"callId":%q,"sequence":"0","type":"admitted"}`, `{"callId":%q,"sequence":"1","type":"text","text":"relayed"}`, `{"callId":%q,"sequence":"2","type":"done","outcome":"succeeded","usage":{"inputUnits":"3","outputUnits":"1","reasoningUnits":"0","cachedInputUnits":"0"}}`} {
-			fmt.Fprintf(w, "id: %d\ndata: "+fr+"\n\n", i, req.CallId)
+			m := &sse.Message{ID: sse.ID(strconv.Itoa(i))}
+			m.AppendData(fmt.Sprintf(fr, req.CallId))
+			_, _ = m.WriteTo(w)
 			fl.Flush()
 		}
 	}))
@@ -867,6 +871,20 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	require.NoError(t, json.Unmarshal(proxy.posts[2].Body, &third))
 	require.NotEqual(t, forwarded.RequestDigest, third.RequestDigest)
 
+	// The tool round trip of the history (an assistant tool call and its
+	// result) is forwarded as the caller stated it; the Proxy validates it.
+	roundTrip := `{"callId":"call_rt","routeId":"controlled-openai-v1","messages":[{"role":"user","content":"Plan."},{"role":"assistant","content":"","toolCalls":[{"toolCallId":"tc_1","name":"read_brief","arguments":"{\"section\":\"hero\"}"}]},{"role":"tool","toolCallId":"tc_1","content":"the brief"}],"maxOutputTokens":16,"maxExposure":{"currency":"USD","amount":"10"}}`
+	rt := h.trusted("POST", "/v1/model/relay", map[string]string{"Content-Type": "application/json"}, []byte(roundTrip))
+	require.Equal(t, 200, rt.Status, string(rt.Raw))
+	var withTools modelproxyapi.ModelCallRequest
+	dec := json.NewDecoder(bytes.NewReader(proxy.posts[3].Body))
+	dec.DisallowUnknownFields()
+	require.NoError(t, dec.Decode(&withTools))
+	require.Len(t, withTools.Messages, 3)
+	require.NotNil(t, withTools.Messages[1].ToolCalls)
+	require.Equal(t, []modelproxyapi.MessageToolCall{{ToolCallId: "tc_1", Name: "read_brief", Arguments: `{"section":"hero"}`}}, *withTools.Messages[1].ToolCalls)
+	require.Equal(t, "tc_1", string(*withTools.Messages[2].ToolCallId))
+
 	for name, body := range map[string]string{
 		"a binding":        `{"callId":"c","routeId":"r","messages":[{"role":"user","content":"x"}],"maxOutputTokens":1,"maxExposure":{"currency":"USD","amount":"1"},"binding":{"tenantId":"tenant_b","operationId":"o","attemptId":"a","executionEpoch":"9"}}`,
 		"a provider key":   `{"callId":"c","routeId":"r","messages":[{"role":"user","content":"x"}],"maxOutputTokens":1,"maxExposure":{"currency":"USD","amount":"1"},"apiKey":"sk-x"}`,
@@ -877,7 +895,7 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 		require.Equal(t, 400, bad.Status, name)
 		require.Equal(t, "INVALID_ARGUMENT", bad.Code, name)
 	}
-	require.Len(t, proxy.posts, 3, "refused requests never reach the Proxy")
+	require.Len(t, proxy.posts, 4, "refused requests never reach the Proxy")
 
 	// The candidate socket relays under the same binding; its own binding is refused.
 	cmd := exec.Command(h.helper)
@@ -891,18 +909,18 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	require.Equal(t, "200 ", rep["candidate:model-relay-bound"])
 	require.Contains(t, rep["candidate:model-relay-frames"], `"text":"relayed"`)
 	require.Equal(t, "400 INVALID_ARGUMENT", rep["candidate:model-relay-binding"], "a candidate cannot name its own binding")
-	require.Len(t, proxy.posts, 4)
+	require.Len(t, proxy.posts, 5)
 	var fromCandidate modelproxyapi.ModelCallRequest
-	require.NoError(t, json.Unmarshal(proxy.posts[3].Body, &fromCandidate))
+	require.NoError(t, json.Unmarshal(proxy.posts[4].Body, &fromCandidate))
 	require.Equal(t, forwarded.Binding, fromCandidate.Binding)
-	require.Equal(t, "Bearer sidecar-token", proxy.posts[3].Auth)
+	require.Equal(t, "Bearer sidecar-token", proxy.posts[4].Auth)
 
 	// A closed attempt ends the relay with the scope.
 	h.control.set(func(f *fakeControl) { f.attempt = controlv1.AttemptState_ATTEMPT_STATE_CLOSED })
 	stale := h.trusted("POST", "/v1/model/relay", nil, []byte(relayBody))
 	require.Equal(t, 403, stale.Status)
 	require.Equal(t, "STALE_EXECUTION", stale.Code)
-	require.Len(t, proxy.posts, 4)
+	require.Len(t, proxy.posts, 5)
 }
 
 func ptr(s string) *string { return &s }
