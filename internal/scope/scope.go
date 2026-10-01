@@ -83,6 +83,10 @@ type Scope struct {
 	RecoveryEpoch  string    `json:"recoveryEpoch"`
 	LaunchKey      string    `json:"launchKey"`
 	Deadline       time.Time `json:"deadline"`
+	// ProjectID and ActorID are the operation's, as Control records it (the
+	// subject an MCP grant is checked against; never the caller's claim).
+	ProjectID string `json:"projectId"`
+	ActorID   string `json:"actorId"`
 }
 
 // Registration is Control's answer about this Pod as of one read: the
@@ -193,22 +197,31 @@ type Client struct {
 	identity Identity
 }
 
+// transportCredentials is plaintext (DEVELOPMENT_ONLY) or the workload
+// certificate under mtls.
+func transportCredentials(files *TLSFiles) (credentials.TransportCredentials, error) {
+	if files == nil {
+		return insecure.NewCredentials(), nil
+	}
+	cert, err := tls.LoadX509KeyPair(files.CertFile, files.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("identity: client certificate: %w", err)
+	}
+	ca, err := os.ReadFile(files.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("identity: ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, errors.New("identity: ca file holds no certificate")
+	}
+	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: files.ServerName, MinVersion: tls.VersionTLS13}), nil
+}
+
 func Dial(id Identity, o Options) (*Client, error) {
-	creds := insecure.NewCredentials()
-	if o.TLS != nil {
-		cert, err := tls.LoadX509KeyPair(o.TLS.CertFile, o.TLS.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("identity: client certificate: %w", err)
-		}
-		ca, err := os.ReadFile(o.TLS.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("identity: ca: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(ca) {
-			return nil, errors.New("identity: ca file holds no certificate")
-		}
-		creds = credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: o.TLS.ServerName, MinVersion: tls.VersionTLS13})
+	creds, err := transportCredentials(o.TLS)
+	if err != nil {
+		return nil, err
 	}
 	conn, err := grpc.NewClient(o.Address, grpc.WithTransportCredentials(creds))
 	if err != nil {
@@ -276,6 +289,7 @@ func (c *Client) Lookup(ctx context.Context) (*Registration, error) {
 			TenantID: resp.GetTenantId(), OperationID: at.GetOperationId(), AttemptID: at.GetAttemptId(), InstanceID: inst.GetInstanceId(),
 			Current: inst.GetCurrent(), ProfileID: at.GetProfileId(), ExecutionEpoch: at.GetExecutionEpoch(), RecoveryEpoch: resp.GetRecoveryEpoch(),
 			LaunchKey: inst.GetLaunchKey(), Deadline: at.GetDeadline().AsTime(),
+			ProjectID: resp.GetOperation().GetProjectId(), ActorID: resp.GetOperation().GetActorId(),
 		},
 		Instance: inst, Attempt: at, Operation: resp.GetOperation(),
 	}, nil
