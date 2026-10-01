@@ -122,8 +122,19 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	} else {
 		log.Warn("model proxy url not configured; the model relay answers DEPENDENCY_UNAVAILABLE")
 	}
+	var mcpRelay server.MCPRelay
+	if cfg.MCP.Address != "" {
+		m, err := scope.NewMCPRelay(cfg.MCP.Address, tlsFiles, cfg.MCP.Timeout)
+		if err != nil {
+			return fmt.Errorf("mcp relay: %w", err)
+		}
+		defer m.Close()
+		mcpRelay = m
+	} else {
+		log.Warn("mcp address not configured; the tool-call relay answers DEPENDENCY_UNAVAILABLE")
+	}
 	srv := &server.Server{
-		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay,
+		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay, MCP: mcpRelay,
 		Limits: server.Limits{MaxInputBytes: cfg.Limits.MaxInputBytes, MaxTransferBytes: cfg.Limits.MaxTransferBytes, MaxManifestBytes: cfg.Limits.MaxManifestBytes, RequestTimeout: cfg.Limits.RequestTimeout},
 		Log:    log, Now: time.Now,
 	}
@@ -131,7 +142,7 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	errs := make(chan error, 2)
 	go func() { errs <- trusted.Serve(layout.Trusted) }()
 	go func() { errs <- candidate.Serve(layout.Candidate) }()
-	log.Info("access sidecar serving", "dir", layout.Dir, "launchKey", cfg.Launch.LaunchKey, "backend", cfg.Launch.Backend, "identity", cfg.Identity.Mode, "modelRelay", relay != nil)
+	log.Info("access sidecar serving", "dir", layout.Dir, "launchKey", cfg.Launch.LaunchKey, "backend", cfg.Launch.Backend, "identity", cfg.Identity.Mode, "modelRelay", relay != nil, "mcpRelay", mcpRelay != nil)
 
 	select {
 	case <-ctx.Done():

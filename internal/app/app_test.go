@@ -30,6 +30,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	controlv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/control/v1"
+	mcpv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/mcp/v1"
 	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/app"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/config"
@@ -120,7 +121,7 @@ func (f *fakeControl) GetInstance(ctx context.Context, req *controlv1.GetInstanc
 		TenantId: "tenant_a", RecoveryEpoch: "1",
 	}
 	if !f.noOperation {
-		resp.Operation = &controlv1.OperationView{OperationId: "op_1", TenantId: "tenant_a", Lifecycle: f.lifecycle, Control: f.control, ExecutionEpoch: f.opEpoch, Deadline: timestamppb.New(f.deadline.Add(time.Hour))}
+		resp.Operation = &controlv1.OperationView{OperationId: "op_1", TenantId: "tenant_a", ProjectId: "proj_a", ActorId: "user_a", Lifecycle: f.lifecycle, Control: f.control, ExecutionEpoch: f.opEpoch, Deadline: timestamppb.New(f.deadline.Add(time.Hour))}
 	}
 	if !f.operationDeadline.IsZero() && resp.Operation != nil {
 		resp.Operation.Deadline = timestamppb.New(f.operationDeadline)
@@ -697,6 +698,7 @@ func TestCandidateBoundary(t *testing.T) {
 	require.Equal(t, "403 ROUTE_FORBIDDEN", rep["candidate:transfers"])
 	require.Equal(t, "403 ROUTE_FORBIDDEN", rep["candidate:knowledge"])
 	require.Equal(t, "503 DEPENDENCY_UNAVAILABLE", rep["candidate:model-relay"])
+	require.Equal(t, "403 ROUTE_FORBIDDEN", rep["candidate:mcp"], "the tool-call relay exists on the trusted socket only")
 	require.Equal(t, "CLOSED", rep["candidate:fd-delegation"])
 	require.Equal(t, fixedInput, rep["candidate:input-bytes"])
 	require.Equal(t, 0, h.control.accepts, "no candidate request reached Control")
@@ -788,6 +790,7 @@ func candidateProbes(dir, input string) {
 	ask("candidate:transfers", "POST", "/v1/transfers", "x")
 	ask("candidate:knowledge", "POST", "/v1/knowledge/search", "{}")
 	ask("candidate:model-relay", "POST", "/v1/model/relay", "{}")
+	ask("candidate:mcp", "POST", "/v1/mcp/calls", "{}")
 	rep["candidate:model-relay-frames"] = string(ask("candidate:model-relay-bound", "POST", "/v1/model/relay", relayBody))
 	ask("candidate:model-relay-binding", "POST", "/v1/model/relay", `{"callId":"call_c","routeId":"controlled-openai-v1","messages":[{"role":"user","content":"x"}],"maxOutputTokens":16,"maxExposure":{"currency":"USD","amount":"10"},"binding":{"tenantId":"tenant_b","operationId":"op_x","attemptId":"att_x","executionEpoch":"9"}}`)
 	uc, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
@@ -948,6 +951,84 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// fakeMCP is MCP's CallService: it records what the sidecar forwarded and
+// answers the call, or the refusal it is set to.
+type fakeMCP struct {
+	mcpv1.UnimplementedCallServiceServer
+	mu     sync.Mutex
+	reqs   []*mcpv1.CreateCallRequest
+	refuse error
+}
+
+func (f *fakeMCP) CreateCall(_ context.Context, req *mcpv1.CreateCallRequest) (*mcpv1.CreateCallResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reqs = append(f.reqs, req)
+	if f.refuse != nil {
+		return nil, f.refuse
+	}
+	return &mcpv1.CreateCallResponse{Call: &mcpv1.ToolCall{CallId: "call-1", State: mcpv1.CallState_CALL_STATE_SUCCEEDED, Result: []byte(`{"untrusted":true,"content":[]}`),
+		ResultDigest: ptr("sha256:0")}, Existing: len(f.reqs) > 1}, nil
+}
+
+// The MCP tool-call relay (P19): the binding and the subject are the
+// confirmed scope's (the operation's project and actor as Control records
+// them), the command id is namespaced by the instance, the digests cover
+// the caller's exact bytes, a caller-supplied binding is refused, MCP's
+// refusals come back as their codes, and a stale scope forwards nothing.
+func TestMCPRelayBindsTheConfirmedScope(t *testing.T) {
+	fm := &fakeMCP{}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	gs := grpc.NewServer()
+	mcpv1.RegisterCallServiceServer(gs, fm)
+	go gs.Serve(lis)
+	t.Cleanup(gs.Stop)
+	deadline := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	h := startWith(t, true, true, deadline, []string{"ANVILKIT_SIDECAR_MCP_ADDRESS=" + lis.Addr().String()})
+	require.Eventually(t, func() bool { return h.trusted("GET", "/v1/scope", nil, nil).Status == 200 }, 10*time.Second, 100*time.Millisecond)
+	body := `{"commandId":"c-1","grantId":"grt-1","grantRevision":"1","method":"search_issues","arguments":{"query":"open"}}`
+	a := h.trusted("POST", "/v1/mcp/calls", map[string]string{"Authorization": "Bearer candidate-supplied"}, []byte(body))
+	require.Equal(t, 200, a.Status, string(a.Raw))
+	require.Contains(t, string(a.Raw), `"state":"succeeded"`)
+	require.Contains(t, string(a.Raw), `"result":{"untrusted":true,"content":[]}`)
+	require.Len(t, fm.reqs, 1)
+	got := fm.reqs[0]
+	require.Equal(t, "sidecar:inst_1:c-1", got.GetCommand().GetCommandId())
+	require.Equal(t, "user_a", got.GetCommand().GetActorId())
+	require.Equal(t, "proj_a", got.GetScope().GetProjectId(), "the subject is the operation's")
+	require.Equal(t, []string{"op_1", "att_1", "inst_1", "1"}, []string{got.GetOperationId(), got.GetAttemptId(), got.GetInstanceId(), got.GetExecutionEpoch()})
+	require.Equal(t, `{"query":"open"}`, string(got.GetArguments()), "the caller's exact argument bytes")
+	require.Equal(t, scope.DigestOf([]byte(`{"query":"open"}`)), got.GetArgumentDigest())
+	require.Equal(t, deadline.Truncate(time.Millisecond), got.GetDeadline().AsTime())
+	again := h.trusted("POST", "/v1/mcp/calls", nil, []byte(body))
+	require.Equal(t, 200, again.Status)
+	require.Contains(t, string(again.Raw), `"existing":true`)
+	require.Equal(t, fm.reqs[0].GetCommand().GetRequestDigest(), fm.reqs[1].GetCommand().GetRequestDigest(), "the same bytes are the same request")
+	for name, bad := range map[string]string{
+		"a binding":       `{"commandId":"c","grantId":"g","grantRevision":"1","method":"m","arguments":{},"operationId":"op_x"}`,
+		"a tenant":        `{"commandId":"c","grantId":"g","grantRevision":"1","method":"m","arguments":{},"tenantId":"tenant_b"}`,
+		"a digest":        `{"commandId":"c","grantId":"g","grantRevision":"1","method":"m","arguments":{},"argumentDigest":"sha256:00"}`,
+		"no arguments":    `{"commandId":"c","grantId":"g","grantRevision":"1","method":"m"}`,
+		"an empty object": `{}`,
+	} {
+		r := h.trusted("POST", "/v1/mcp/calls", nil, []byte(bad))
+		require.Equal(t, 400, r.Status, name)
+	}
+	require.Len(t, fm.reqs, 2, "refused requests never reach MCP")
+	fm.mu.Lock()
+	fm.refuse = status.Error(codes.PermissionDenied, "FORBIDDEN: RECOVERY_RESTRICTED")
+	fm.mu.Unlock()
+	denied := h.trusted("POST", "/v1/mcp/calls", nil, []byte(strings.Replace(body, "c-1", "c-2", 1)))
+	require.Equal(t, 403, denied.Status)
+	require.Equal(t, "PermissionDenied", denied.Code)
+	h.control.set(func(f *fakeControl) { f.attempt = controlv1.AttemptState_ATTEMPT_STATE_CLOSED })
+	stale := h.trusted("POST", "/v1/mcp/calls", nil, []byte(strings.Replace(body, "c-1", "c-3", 1)))
+	require.Equal(t, 403, stale.Status)
+	require.Equal(t, "STALE_EXECUTION", stale.Code)
+	require.Len(t, fm.reqs, 3)
+}
 
 // confirmedClient uses the same clock-passing boundary as app.resolver.
 type confirmedClient struct{ *scope.Client }
