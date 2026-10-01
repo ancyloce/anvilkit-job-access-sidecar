@@ -26,6 +26,10 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	mcpv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/mcp/v1"
 	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
@@ -129,6 +133,12 @@ type ScopeSource interface {
 	Load(ctx context.Context, s *scope.Scope, handle string, maxBytes int64) (*scope.Loaded, error)
 }
 
+// MCPRelay creates (or, for the same request, answers) a bound tool call
+// at MCP; nil when no MCP placement is configured (P19).
+type MCPRelay interface {
+	Call(ctx context.Context, req *mcpv1.CreateCallRequest) (*mcpv1.CreateCallResponse, error)
+}
+
 // ModelRelay forwards one bound model request to the Model Proxy and copies
 // the answer to w; nil when no Proxy is configured (P11).
 type ModelRelay interface {
@@ -142,6 +152,7 @@ type Server struct {
 	Inputs       *Inputs
 	Scope        ScopeSource
 	Relay        ModelRelay
+	MCP          MCPRelay
 	Limits       Limits
 	Log          *slog.Logger
 	Now          func() time.Time
@@ -274,6 +285,72 @@ func (s *Server) modelRelay(w http.ResponseWriter, r *http.Request) {
 		s.Log.Warn("model relay failed", "callId", req.CallID, "error", err.Error())
 		fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "model proxy unreachable")
 	}
+}
+
+// toolCall is the relay's answer: the call's state and, once known, its
+// normalized result (untrusted data) and failure code.
+type toolCall struct {
+	CallID       string          `json:"callId"`
+	State        string          `json:"state"`
+	Existing     bool            `json:"existing"`
+	FailureCode  string          `json:"failureCode,omitempty"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	ResultDigest string          `json:"resultDigest,omitempty"`
+}
+
+var mcpStatus = map[codes.Code]int{
+	codes.InvalidArgument: http.StatusBadRequest, codes.NotFound: http.StatusNotFound, codes.PermissionDenied: http.StatusForbidden,
+	codes.AlreadyExists: http.StatusConflict, codes.FailedPrecondition: http.StatusConflict, codes.Unavailable: http.StatusServiceUnavailable,
+	codes.DeadlineExceeded: http.StatusGatewayTimeout,
+}
+
+// mcpCall relays one tool call: the caller names its command, grant,
+// method and arguments; the sidecar binds the confirmed scope. Repeating
+// the identical request is how the harness reads the call's current state:
+// it answers the original call and never sends again.
+func (s *Server) mcpCall(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.Limits.MaxInputBytes))
+	if err != nil {
+		fail(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "")
+		return
+	}
+	if s.MCP == nil {
+		fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "mcp upstream not configured")
+		return
+	}
+	req, err := scope.ParseCallRequest(raw)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", "commandId, grantId, grantRevision, method, arguments and deadline only: "+err.Error())
+		return
+	}
+	sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
+	if !s.answerScopeError(w, err) {
+		return
+	}
+	bound, err := scope.BindCall(sc, req, raw)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	resp, err := s.MCP.Call(r.Context(), bound)
+	if err != nil {
+		st := status.Convert(err)
+		code, ok := mcpStatus[st.Code()]
+		if !ok {
+			s.Log.Warn("mcp relay failed", "commandId", req.CommandID, "code", st.Code().String())
+			fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "mcp unreachable")
+			return
+		}
+		fail(w, code, st.Code().String(), st.Message())
+		return
+	}
+	c := resp.GetCall()
+	out := toolCall{CallID: c.GetCallId(), State: strings.ToLower(strings.TrimPrefix(c.GetState().String(), "CALL_STATE_")), Existing: resp.GetExisting(),
+		FailureCode: c.GetFailureCode(), ResultDigest: c.GetResultDigest()}
+	if len(c.GetResult()) > 0 && json.Valid(c.GetResult()) {
+		out.Result = c.GetResult()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // Trusted is the trusted route set.
@@ -456,12 +533,12 @@ func (s *Server) Trusted() http.Handler {
 			fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", dep+" upstream not configured")
 		}
 	}
-	// The trusted harness reaches the same controlled model relay; the
-	// Knowledge and MCP expert relays are reserved for their units
-	// (P16/P19) and never exist on the candidate socket.
+	// The trusted harness reaches the same controlled model relay and the
+	// MCP tool-call relay (P19); the Knowledge expert relay is reserved for
+	// its unit (P16). None exists on the candidate socket.
 	mux.HandleFunc("POST /v1/model/relay", s.modelRelay)
 	mux.HandleFunc("POST /v1/knowledge/", unavailable("knowledge (P16)"))
-	mux.HandleFunc("POST /v1/mcp/", unavailable("mcp (P19)"))
+	mux.HandleFunc("POST /v1/mcp/calls", s.mcpCall)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "ROUTE_FORBIDDEN", "")
 	})
