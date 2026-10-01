@@ -93,6 +93,15 @@ type ModelProxy struct {
 	Timeout time.Duration `koanf:"timeout"`
 }
 
+// MCP is the MCP placement of the tool-call relay (P19): CallService's
+// gRPC address, reached plaintext under identity.mode development
+// (DEVELOPMENT_ONLY) or with the workload certificate under mtls. Without
+// an address the relay answers DEPENDENCY_UNAVAILABLE.
+type MCP struct {
+	Address string        `koanf:"address"`
+	Timeout time.Duration `koanf:"timeout"`
+}
+
 type Limits struct {
 	MaxInputBytes    int64         `koanf:"max_input_bytes"`
 	MaxTransferBytes int64         `koanf:"max_transfer_bytes"`
@@ -107,6 +116,7 @@ type Config struct {
 	Identity        Identity      `koanf:"identity"`
 	Launch          Launch        `koanf:"launch"`
 	ModelProxy      ModelProxy    `koanf:"model_proxy"`
+	MCP             MCP           `koanf:"mcp"`
 	Limits          Limits        `koanf:"limits"`
 	ShutdownTimeout time.Duration `koanf:"shutdown_timeout"`
 }
@@ -119,6 +129,7 @@ var defaults = map[string]any{
 	"control.timeout":           "15s",
 	"identity.mode":             IdentityDisabled,
 	"model_proxy.timeout":       "5m",
+	"mcp.timeout":               "2m",
 	"limits.max_input_bytes":    1 << 20,
 	"limits.max_transfer_bytes": 64 << 20,
 	"limits.max_manifest_bytes": 16384,
@@ -138,6 +149,7 @@ var envOverrides = map[string]string{
 	"ANVILKIT_SIDECAR_LAUNCH_ENVELOPE":   "launch.envelope",
 	"ANVILKIT_SIDECAR_MODEL_PROXY_URL":   "model_proxy.url",
 	"ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN": "model_proxy.token",
+	"ANVILKIT_SIDECAR_MCP_ADDRESS":       "mcp.address",
 }
 
 var launchKeyPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
@@ -247,6 +259,9 @@ func (c Config) validate() error {
 		if c.Identity.Mode == IdentityDevelopment && c.ModelProxy.Token == "" {
 			errs = append(errs, errors.New("ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN (model_proxy.token) is required with a model proxy url under identity.mode development"))
 		}
+	}
+	if c.MCP.Timeout < time.Second || c.MCP.Timeout > time.Hour {
+		errs = append(errs, fmt.Errorf("mcp.timeout %s outside [1s, 1h]", c.MCP.Timeout))
 	}
 	if c.ModelProxy.Timeout < time.Second || c.ModelProxy.Timeout > time.Hour {
 		errs = append(errs, fmt.Errorf("model_proxy.timeout %s outside [1s, 1h]", c.ModelProxy.Timeout))
