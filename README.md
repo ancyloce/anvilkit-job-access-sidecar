@@ -24,7 +24,8 @@ Per-job access proxy for credential isolation, scoped model and artifact access,
 | trusted | `POST /v1/results` | `AcceptResult` under the current instance and execution epoch; a repeat of the same bytes reenters the same stage, another result is refused by Control |
 | trusted | `GET /v1/results` | The accepted stage of the attempt as Control records it (`GetAcceptedStage`: identity, verdict, result digest, epochs, bound artifacts with their object versions; `404 NOT_FOUND` until a result is accepted), read under the result authority — the first question of the P12 joint stage recovery, never a resend or a reopening |
 | trusted | `POST /v1/model/relay` | The same controlled model relay for the trusted harness's experts |
-| trusted | `/v1/knowledge/…`, `/v1/mcp/…` | Trusted expert relays; `503 DEPENDENCY_UNAVAILABLE` until their units wire an upstream |
+| trusted | `/v1/knowledge/…` | Trusted expert relay; `503 DEPENDENCY_UNAVAILABLE` until its unit wires an upstream |
+| trusted | `POST /v1/mcp/calls` | MCP tool-call relay (P19): the caller sends only `commandId`, `grantId`, `grantRevision`, `method`, `arguments` (and an earlier `deadline`); the sidecar binds the confirmed scope (tenant, the operation's project and actor, operation, attempt, instance, epoch), namespaces the command by instance and digests the exact bytes, then calls MCP's `CallService.CreateCall` (`ANVILKIT_SIDECAR_MCP_ADDRESS`; plaintext DEVELOPMENT_ONLY or the workload certificate under mtls). Repeating the identical request answers the original call and never sends again; `503 DEPENDENCY_UNAVAILABLE` without an MCP placement |
 
 ## Configuration
 
