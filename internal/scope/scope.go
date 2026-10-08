@@ -19,14 +19,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +36,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	controlv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/control/v1"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/identity"
 )
 
 // ActorID is the actor every command of the sidecar carries.
@@ -185,7 +183,28 @@ type Options struct {
 	Upload *http.Client
 }
 
-type TLSFiles struct{ CertFile, KeyFile, CAFile, ServerName string }
+// TLSFiles is the workload identity material and the server name the
+// target's certificate must carry; Reloader, when set, is the process's
+// shared watcher of those files (every new handshake uses its current
+// material).
+type TLSFiles struct {
+	CertFile, KeyFile, CAFile, ServerName string
+	Reloader                              *identity.Reloader
+}
+
+// reloader returns the shared Reloader or starts one over the files.
+func (f *TLSFiles) reloader() (*identity.Reloader, error) {
+	if f.Reloader != nil {
+		return f.Reloader, nil
+	}
+	r, err := identity.New(identity.Files{CertFile: f.CertFile, KeyFile: f.KeyFile, CAFile: f.CAFile}, 0, nil)
+	if err != nil {
+		return nil, fmt.Errorf("identity: %w", err)
+	}
+	r.Start()
+	f.Reloader = r
+	return r, nil
+}
 
 // Client talks to Control's ExecutionService and ArtifactService.
 type Client struct {
@@ -197,25 +216,19 @@ type Client struct {
 	identity Identity
 }
 
-// transportCredentials is plaintext (DEVELOPMENT_ONLY) or the workload
-// certificate under mtls.
+// transportCredentials is plaintext (the DEVELOPMENT_ONLY identity the
+// configuration loader admits only under its development guard) or the
+// rotating workload certificate under mtls, verifying the server by its
+// DNS SAN.
 func transportCredentials(files *TLSFiles) (credentials.TransportCredentials, error) {
 	if files == nil {
 		return insecure.NewCredentials(), nil
 	}
-	cert, err := tls.LoadX509KeyPair(files.CertFile, files.KeyFile)
+	r, err := files.reloader()
 	if err != nil {
-		return nil, fmt.Errorf("identity: client certificate: %w", err)
+		return nil, err
 	}
-	ca, err := os.ReadFile(files.CAFile)
-	if err != nil {
-		return nil, fmt.Errorf("identity: ca: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(ca) {
-		return nil, errors.New("identity: ca file holds no certificate")
-	}
-	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: files.ServerName, MinVersion: tls.VersionTLS13}), nil
+	return identity.NewClientCredentials(r, files.ServerName)
 }
 
 func Dial(id Identity, o Options) (*Client, error) {

@@ -4,18 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/identity"
 )
 
 // The controlled model relay (DD-03 §5 "controlled model relay", delivery.md
@@ -65,22 +64,24 @@ func NewRelay(o RelayOptions) (*Relay, error) {
 		return nil, errors.New("model relay: exactly one of a bearer token (development) or the mtls identity is required")
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DisableCompression = true
 	if o.TLS != nil {
-		cert, err := tls.LoadX509KeyPair(o.TLS.CertFile, o.TLS.KeyFile)
+		// Every new connection handshakes with the current identity material
+		// and verifies the Proxy by server name (a DNS SAN of its certificate).
+		r, err := o.TLS.reloader()
 		if err != nil {
-			return nil, fmt.Errorf("model relay: client certificate: %w", err)
+			return nil, fmt.Errorf("model relay: %w", err)
 		}
-		ca, err := os.ReadFile(o.TLS.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("model relay: ca: %w", err)
+		serverName := o.TLS.ServerName
+		if serverName == "" {
+			u, err := url.Parse(o.URL)
+			if err != nil || u.Hostname() == "" {
+				return nil, errors.New("model relay: url has no host for hostname verification")
+			}
+			serverName = u.Hostname()
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(ca) {
-			return nil, errors.New("model relay: ca file holds no certificate")
-		}
-		transport.TLSClientConfig = &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: o.TLS.ServerName, MinVersion: tls.VersionTLS13}
+		transport = identity.HTTPTransport(r, serverName)
 	}
+	transport.DisableCompression = true
 	httpClient := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	opts := []modelproxyapi.ClientOption{modelproxyapi.WithHTTPClient(httpClient)}
 	if o.Token != "" {
