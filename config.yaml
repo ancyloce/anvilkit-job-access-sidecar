@@ -16,11 +16,28 @@ sockets:
   owner_uid: 10002
 control:
   timeout: 15s
+# development: the top-level DEVELOPMENT_ONLY guard (P0.1): the plaintext
+# development identity is admitted only while it is true; the image bakes
+# it false, so a Job template can select development only against an image
+# built from a development configuration.
+development:
+  enabled: false
 identity:
   mode: disabled
-  # mtls: cert_file, key_file, ca_file and server_name are the workload
-  # identity material of the production path (ENV-03), mounted into this
-  # container only.
+  # mtls: the workload identity material (P0.1), mounted by the Job template
+  # into this container only at /etc/anvilkit/identity (the Workflow chart's
+  # anvilkit-job-access-sidecar-identity Certificate); server_name is the
+  # DNS SAN Control's certificate must carry. The files are watched and
+  # reloaded as a whole.
+  mtls:
+    cert_file: /etc/anvilkit/identity/tls.crt
+    key_file: /etc/anvilkit/identity/tls.key
+    ca_file: /etc/anvilkit/identity/ca.crt
+    server_name: anvilkit-agent-control
+# mcp.server_name is the DNS SAN MCP's certificate must carry under mtls
+# (the address is the environment's ANVILKIT_SIDECAR_MCP_ADDRESS).
+mcp:
+  server_name: anvilkit-agent-mcp
 limits:
   max_input_bytes: 1048576
   max_transfer_bytes: 67108864
