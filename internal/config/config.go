@@ -91,6 +91,9 @@ type ModelProxy struct {
 	URL     string        `koanf:"url"`
 	Token   string        `koanf:"token"`
 	Timeout time.Duration `koanf:"timeout"`
+	// ServerName is the DNS SAN the Proxy's certificate must carry under
+	// mtls; empty verifies the URL's host.
+	ServerName string `koanf:"server_name"`
 }
 
 // MCP is the MCP placement of the tool-call relay (P19): CallService's
@@ -100,6 +103,15 @@ type ModelProxy struct {
 type MCP struct {
 	Address string        `koanf:"address"`
 	Timeout time.Duration `koanf:"timeout"`
+	// ServerName is the DNS SAN MCP's certificate must carry under mtls.
+	ServerName string `koanf:"server_name"`
+}
+
+// Development is the top-level DEVELOPMENT_ONLY guard (P0.1): the
+// plaintext development identity is admitted only while it is true;
+// file-only, baked into the image as false.
+type Development struct {
+	Enabled bool `koanf:"enabled"`
 }
 
 type Limits struct {
@@ -111,6 +123,7 @@ type Limits struct {
 }
 
 type Config struct {
+	Development     Development   `koanf:"development"`
 	Sockets         Sockets       `koanf:"sockets"`
 	Control         Control       `koanf:"control"`
 	Identity        Identity      `koanf:"identity"`
@@ -128,6 +141,12 @@ var defaults = map[string]any{
 	"sockets.owner_uid":         10002,
 	"control.timeout":           "15s",
 	"identity.mode":             IdentityDisabled,
+	"identity.mtls.cert_file":   "/etc/anvilkit/identity/tls.crt",
+	"identity.mtls.key_file":    "/etc/anvilkit/identity/tls.key",
+	"identity.mtls.ca_file":     "/etc/anvilkit/identity/ca.crt",
+	"identity.mtls.server_name": "anvilkit-agent-control",
+	"mcp.server_name":           "anvilkit-agent-mcp",
+	"development.enabled":       false,
 	"model_proxy.timeout":       "5m",
 	"mcp.timeout":               "2m",
 	"limits.max_input_bytes":    1 << 20,
@@ -241,13 +260,19 @@ func (c Config) validate() error {
 		if c.Control.Address == "" {
 			errs = append(errs, errors.New("control.address is required unless identity.mode is disabled"))
 		}
+		if !c.Development.Enabled {
+			errs = append(errs, errors.New("identity.mode development (plaintext) requires development.enabled: true in the reviewed file (DEVELOPMENT_ONLY)"))
+		}
 	case IdentityMTLS:
 		if c.Control.Address == "" {
 			errs = append(errs, errors.New("control.address is required unless identity.mode is disabled"))
 		}
 		m := c.Identity.MTLS
-		if m.CertFile == "" || m.KeyFile == "" || m.CAFile == "" {
-			errs = append(errs, errors.New("identity.mtls.cert_file, key_file and ca_file are required for identity.mode mtls"))
+		if m.CertFile == "" || m.KeyFile == "" || m.CAFile == "" || m.ServerName == "" {
+			errs = append(errs, errors.New("identity.mtls.cert_file, key_file, ca_file and server_name are required for identity.mode mtls"))
+		}
+		if c.MCP.Address != "" && c.MCP.ServerName == "" {
+			errs = append(errs, errors.New("mcp.server_name is required with an mcp.address under identity.mode mtls"))
 		}
 	default:
 		errs = append(errs, fmt.Errorf("identity.mode %q is not one of disabled, development, mtls", c.Identity.Mode))
