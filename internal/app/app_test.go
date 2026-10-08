@@ -292,7 +292,7 @@ func startWith(t *testing.T, registered, current bool, deadline time.Time, extra
 	t.Cleanup(func() { h.srv.Stop() })
 
 	cfgPath := filepath.Join(root, "config.yaml")
-	require.NoError(t, os.WriteFile(cfgPath, []byte("control:\n  timeout: 5s\nidentity:\n  mode: development\n"), 0o644))
+	require.NoError(t, os.WriteFile(cfgPath, []byte("development:\n  enabled: true\ncontrol:\n  timeout: 5s\nidentity:\n  mode: development\n"), 0o644))
 	cmd := exec.Command(helper)
 	cmd.Env = []string{"SIDECAR_HELPER=serve", "ANVILKIT_SIDECAR_CONFIG=" + cfgPath, "ANVILKIT_SIDECAR_CONTROL_ADDRESS=" + h.controlAddr,
 		"ANVILKIT_SIDECAR_SOCKETS_DIR=" + h.dir, "ANVILKIT_SIDECAR_BACKEND=test-backend", "ANVILKIT_SIDECAR_LAUNCH_KEY=cg-test", "ANVILKIT_SIDECAR_POD_UID=pod-1", "ANVILKIT_SIDECAR_LAUNCH_ENVELOPE=" + envelopeJSON}

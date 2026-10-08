@@ -15,6 +15,7 @@ import (
 
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/config"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/identity"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/server"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
@@ -81,8 +82,16 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	}
 	var tlsFiles *scope.TLSFiles
 	if cfg.Identity.Mode == config.IdentityMTLS {
+		// One watcher of the mounted identity for every connection of this
+		// process; the files are reloaded as a whole and never fall back.
 		m := cfg.Identity.MTLS
-		tlsFiles = &scope.TLSFiles{CertFile: m.CertFile, KeyFile: m.KeyFile, CAFile: m.CAFile, ServerName: m.ServerName}
+		reloader, err := identity.New(identity.Files{CertFile: m.CertFile, KeyFile: m.KeyFile, CAFile: m.CAFile}, 0, log)
+		if err != nil {
+			return fmt.Errorf("identity: %w", err)
+		}
+		reloader.Start()
+		defer reloader.Stop()
+		tlsFiles = &scope.TLSFiles{CertFile: m.CertFile, KeyFile: m.KeyFile, CAFile: m.CAFile, ServerName: m.ServerName, Reloader: reloader}
 	} else {
 		log.Warn("DEVELOPMENT_ONLY identity: plaintext Control transport; qualifies no production identity")
 	}
@@ -110,7 +119,9 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if cfg.ModelProxy.URL != "" {
 		o := scope.RelayOptions{URL: cfg.ModelProxy.URL, Timeout: cfg.ModelProxy.Timeout}
 		if tlsFiles != nil {
-			o.TLS = tlsFiles
+			proxyTLS := *tlsFiles
+			proxyTLS.ServerName = cfg.ModelProxy.ServerName
+			o.TLS = &proxyTLS
 		} else {
 			o.Token = cfg.ModelProxy.Token
 		}
@@ -124,7 +135,13 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	}
 	var mcpRelay server.MCPRelay
 	if cfg.MCP.Address != "" {
-		m, err := scope.NewMCPRelay(cfg.MCP.Address, tlsFiles, cfg.MCP.Timeout)
+		var mcpTLS *scope.TLSFiles
+		if tlsFiles != nil {
+			t := *tlsFiles
+			t.ServerName = cfg.MCP.ServerName
+			mcpTLS = &t
+		}
+		m, err := scope.NewMCPRelay(cfg.MCP.Address, mcpTLS, cfg.MCP.Timeout)
 		if err != nil {
 			return fmt.Errorf("mcp relay: %w", err)
 		}
