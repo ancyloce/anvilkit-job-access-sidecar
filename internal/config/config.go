@@ -91,6 +91,12 @@ type ModelProxy struct {
 	URL     string        `koanf:"url"`
 	Token   string        `koanf:"token"`
 	Timeout time.Duration `koanf:"timeout"`
+	// IdentityMode is this connection's own identity (P0.1: a plaintext
+	// connection exists only where that connection selects development):
+	// empty follows identity.mode; development is the DEVELOPMENT_ONLY
+	// bearer token and needs development.enabled; mtls presents the
+	// workload certificate and needs identity.mode mtls.
+	IdentityMode string `koanf:"identity_mode"`
 	// ServerName is the DNS SAN the Proxy's certificate must carry under
 	// mtls; empty verifies the URL's host.
 	ServerName string `koanf:"server_name"`
@@ -212,6 +218,9 @@ func LoadFrom(path string, environ []string) (Config, error) {
 	}}); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
+	if c.ModelProxy.IdentityMode == "" {
+		c.ModelProxy.IdentityMode = c.Identity.Mode
+	}
 	return c, c.validate()
 }
 
@@ -281,8 +290,21 @@ func (c Config) validate() error {
 		if u, err := url.Parse(c.ModelProxy.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 			errs = append(errs, errors.New("ANVILKIT_SIDECAR_MODEL_PROXY_URL (model_proxy.url) must be an absolute http(s) URL without credentials"))
 		}
-		if c.Identity.Mode == IdentityDevelopment && c.ModelProxy.Token == "" {
-			errs = append(errs, errors.New("ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN (model_proxy.token) is required with a model proxy url under identity.mode development"))
+		switch c.ModelProxy.IdentityMode {
+		case IdentityDevelopment:
+			if c.ModelProxy.Token == "" {
+				errs = append(errs, errors.New("ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN (model_proxy.token) is required with a model proxy url under the development identity"))
+			}
+			if !c.Development.Enabled {
+				errs = append(errs, errors.New("model_proxy.identity_mode development (bearer) requires development.enabled: true in the reviewed file (DEVELOPMENT_ONLY)"))
+			}
+		case IdentityMTLS:
+			if c.Identity.Mode != IdentityMTLS {
+				errs = append(errs, errors.New("model_proxy.identity_mode mtls needs the workload identity of identity.mode mtls"))
+			}
+		case IdentityDisabled:
+		default:
+			errs = append(errs, fmt.Errorf("model_proxy.identity_mode %q is not one of development, mtls", c.ModelProxy.IdentityMode))
 		}
 	}
 	if c.MCP.Timeout < time.Second || c.MCP.Timeout > time.Hour {
