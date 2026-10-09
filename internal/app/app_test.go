@@ -826,6 +826,20 @@ type fakeProxy struct {
 	}
 }
 
+// recorded returns a copy of the forwarded requests under the lock (the
+// handler appends from the server's goroutines).
+func (f *fakeProxy) recorded() []struct {
+	Auth string
+	Body []byte
+} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]struct {
+		Auth string
+		Body []byte
+	}(nil), f.posts...)
+}
+
 func newFakeProxy(t *testing.T) *fakeProxy {
 	f := &fakeProxy{}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -871,10 +885,10 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	require.Equal(t, 200, a.Status, string(a.Raw))
 	require.Contains(t, string(a.Raw), `"type":"text","text":"relayed"`)
 	require.Contains(t, string(a.Raw), `"sequence":"2","type":"done"`)
-	require.Len(t, proxy.posts, 1)
-	require.Equal(t, "Bearer sidecar-token", proxy.posts[0].Auth, "the sidecar presents its own identity, never the caller's header")
+	require.Len(t, proxy.recorded(), 1)
+	require.Equal(t, "Bearer sidecar-token", proxy.recorded()[0].Auth, "the sidecar presents its own identity, never the caller's header")
 	var forwarded modelproxyapi.ModelCallRequest
-	require.NoError(t, json.Unmarshal(proxy.posts[0].Body, &forwarded))
+	require.NoError(t, json.Unmarshal(proxy.recorded()[0].Body, &forwarded))
 	require.Equal(t, "call_c", forwarded.CallId)
 	require.Equal(t, "controlled-openai-v1", forwarded.RouteId)
 	require.Equal(t, modelproxyapi.ExecutionBinding{TenantId: "tenant_a", OperationId: "op_1", AttemptId: "att_1", InstanceId: ptr("inst_1"), ExecutionEpoch: "1"}, forwarded.Binding, "the binding is the confirmed scope")
@@ -890,12 +904,12 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	// answers the recorded call); changed bytes change the digest.
 	again := h.trusted("POST", "/v1/model/relay", map[string]string{"Content-Type": "application/json"}, []byte(relayBody))
 	require.Equal(t, 200, again.Status)
-	require.Len(t, proxy.posts, 2)
-	require.Equal(t, proxy.posts[0].Body, proxy.posts[1].Body)
+	require.Len(t, proxy.recorded(), 2)
+	require.Equal(t, proxy.recorded()[0].Body, proxy.recorded()[1].Body)
 	changed := h.trusted("POST", "/v1/model/relay", nil, []byte(strings.Replace(relayBody, "Plan.", "Plan!", 1)))
 	require.Equal(t, 200, changed.Status)
 	var third modelproxyapi.ModelCallRequest
-	require.NoError(t, json.Unmarshal(proxy.posts[2].Body, &third))
+	require.NoError(t, json.Unmarshal(proxy.recorded()[2].Body, &third))
 	require.NotEqual(t, forwarded.RequestDigest, third.RequestDigest)
 
 	// The tool round trip of the history (an assistant tool call and its
@@ -904,7 +918,7 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	rt := h.trusted("POST", "/v1/model/relay", map[string]string{"Content-Type": "application/json"}, []byte(roundTrip))
 	require.Equal(t, 200, rt.Status, string(rt.Raw))
 	var withTools modelproxyapi.ModelCallRequest
-	dec := json.NewDecoder(bytes.NewReader(proxy.posts[3].Body))
+	dec := json.NewDecoder(bytes.NewReader(proxy.recorded()[3].Body))
 	dec.DisallowUnknownFields()
 	require.NoError(t, dec.Decode(&withTools))
 	require.Len(t, withTools.Messages, 3)
@@ -922,7 +936,7 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 		require.Equal(t, 400, bad.Status, name)
 		require.Equal(t, "INVALID_ARGUMENT", bad.Code, name)
 	}
-	require.Len(t, proxy.posts, 4, "refused requests never reach the Proxy")
+	require.Len(t, proxy.recorded(), 4, "refused requests never reach the Proxy")
 
 	// The candidate socket relays under the same binding; its own binding is refused.
 	cmd := exec.Command(h.helper)
@@ -936,18 +950,18 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	require.Equal(t, "200 ", rep["candidate:model-relay-bound"])
 	require.Contains(t, rep["candidate:model-relay-frames"], `"text":"relayed"`)
 	require.Equal(t, "400 INVALID_ARGUMENT", rep["candidate:model-relay-binding"], "a candidate cannot name its own binding")
-	require.Len(t, proxy.posts, 5)
+	require.Len(t, proxy.recorded(), 5)
 	var fromCandidate modelproxyapi.ModelCallRequest
-	require.NoError(t, json.Unmarshal(proxy.posts[4].Body, &fromCandidate))
+	require.NoError(t, json.Unmarshal(proxy.recorded()[4].Body, &fromCandidate))
 	require.Equal(t, forwarded.Binding, fromCandidate.Binding)
-	require.Equal(t, "Bearer sidecar-token", proxy.posts[4].Auth)
+	require.Equal(t, "Bearer sidecar-token", proxy.recorded()[4].Auth)
 
 	// A closed attempt ends the relay with the scope.
 	h.control.set(func(f *fakeControl) { f.attempt = controlv1.AttemptState_ATTEMPT_STATE_CLOSED })
 	stale := h.trusted("POST", "/v1/model/relay", nil, []byte(relayBody))
 	require.Equal(t, 403, stale.Status)
 	require.Equal(t, "STALE_EXECUTION", stale.Code)
-	require.Len(t, proxy.posts, 5)
+	require.Len(t, proxy.recorded(), 5)
 }
 
 func ptr(s string) *string { return &s }
@@ -1032,6 +1046,10 @@ func TestMCPRelayBindsTheConfirmedScope(t *testing.T) {
 
 // confirmedClient uses the same clock-passing boundary as app.resolver.
 type confirmedClient struct{ *scope.Client }
+
+func (c confirmedClient) Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, _ string, manifest []byte) (*scope.Stage, error) {
+	return c.Client.Submit(ctx, s, verdict, failureCode, manifest)
+}
 
 func (c confirmedClient) Confirm(ctx context.Context, now func() time.Time, purpose scope.Purpose) (*scope.Scope, error) {
 	return c.Client.Confirm(ctx, scope.Binding{OperationID: "op_1", AttemptID: "att_1", ProfileID: "harness-wiring-dev-v1", LaunchKey: "cg-test", ExecutionEpoch: "1", LaunchEpoch: "1"}, now, purpose)

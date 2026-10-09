@@ -51,8 +51,12 @@ func (r *resolver) Upload(ctx context.Context, s *scope.Scope, class, mediaType 
 	return r.client.Upload(ctx, s, class, mediaType, body)
 }
 
+// Submit forwards the trusted observer's result. The in-Pod observer's
+// label stays diagnostic: Control records this sidecar's verified workload
+// identity as the observer (P0.2).
 func (r *resolver) Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, observer string, manifest []byte) (*scope.Stage, error) {
-	return r.client.Submit(ctx, s, verdict, failureCode, observer, manifest)
+	r.log.Info("result submitted", "attemptId", s.AttemptID, "instanceId", s.InstanceID, "observer", observer, "verdict", verdict)
+	return r.client.Submit(ctx, s, verdict, failureCode, manifest)
 }
 
 func (r *resolver) AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.AcceptedStage, error) {
@@ -118,11 +122,12 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	var relay server.ModelRelay
 	if cfg.ModelProxy.URL != "" {
 		o := scope.RelayOptions{URL: cfg.ModelProxy.URL, Timeout: cfg.ModelProxy.Timeout}
-		if tlsFiles != nil {
+		if cfg.ModelProxy.IdentityMode == config.IdentityMTLS {
 			proxyTLS := *tlsFiles
 			proxyTLS.ServerName = cfg.ModelProxy.ServerName
 			o.TLS = &proxyTLS
 		} else {
+			log.Warn("DEVELOPMENT_ONLY model proxy identity: bearer token; qualifies no production identity")
 			o.Token = cfg.ModelProxy.Token
 		}
 		r, err := scope.NewRelay(o)
