@@ -21,6 +21,8 @@ var (
 	sequencePattern  = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 	launchKeyPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 	inputNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	componentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	puckTypePattern  = regexp.MustCompile(`^[A-Z][A-Za-z0-9]{0,63}$`)
 	jobKinds         = map[string]bool{"codegen": true, "validator": true, "preview": true, "parser": true, "migration": true}
 )
 
@@ -32,20 +34,30 @@ type Input struct {
 	Handle string `json:"handle,omitempty"`
 }
 
+// Component is the allocated identity a launch certifies or produces
+// (P0.8; the sidecar only carries it, the Job enforces it).
+type Component struct {
+	ComponentID    string `json:"componentId"`
+	PuckType       string `json:"puckType"`
+	PackageName    string `json:"packageName"`
+	SourceRevision string `json:"sourceRevision"`
+}
+
 // Envelope is the launch envelope.
 type Envelope struct {
-	SchemaVersion   int     `json:"schemaVersion"`
-	LaunchID        string  `json:"launchId"`
-	LaunchKey       string  `json:"launchKey"`
-	OperationID     string  `json:"operationId"`
-	AttemptID       string  `json:"attemptId"`
-	ProfileID       string  `json:"profileId"`
-	ProfileRevision string  `json:"profileRevision"`
-	JobKind         string  `json:"jobKind"`
-	ExecutionEpoch  string  `json:"executionEpoch"`
-	LaunchEpoch     string  `json:"launchEpoch"`
-	Deadline        string  `json:"deadline"`
-	Inputs          []Input `json:"inputs"`
+	SchemaVersion   int        `json:"schemaVersion"`
+	LaunchID        string     `json:"launchId"`
+	LaunchKey       string     `json:"launchKey"`
+	OperationID     string     `json:"operationId"`
+	AttemptID       string     `json:"attemptId"`
+	ProfileID       string     `json:"profileId"`
+	ProfileRevision string     `json:"profileRevision"`
+	JobKind         string     `json:"jobKind"`
+	ExecutionEpoch  string     `json:"executionEpoch"`
+	LaunchEpoch     string     `json:"launchEpoch"`
+	Deadline        string     `json:"deadline"`
+	Component       *Component `json:"component,omitempty"`
+	Inputs          []Input    `json:"inputs"`
 }
 
 // Parse decodes and checks an envelope; unknown fields are refused.
@@ -80,6 +92,19 @@ func Parse(raw []byte) (Envelope, error) {
 	}
 	if _, err := e.DeadlineTime(); err != nil {
 		return Envelope{}, err
+	}
+	if c := e.Component; c != nil {
+		// The revision always; the allocated identity whole or not at all.
+		named := 0
+		for _, v := range []string{c.ComponentID, c.PuckType, c.PackageName} {
+			if v != "" {
+				named++
+			}
+		}
+		if !sequencePattern.MatchString(c.SourceRevision) || (named != 0 && named != 3) ||
+			(named == 3 && (!componentPattern.MatchString(c.ComponentID) || !puckTypePattern.MatchString(c.PuckType) || len(c.PackageName) > 214)) {
+			return Envelope{}, fmt.Errorf("launch envelope: component is not a source revision with an optional whole allocated identity")
+		}
 	}
 	if len(e.Inputs) > 64 {
 		return Envelope{}, fmt.Errorf("launch envelope: more than 64 inputs")
