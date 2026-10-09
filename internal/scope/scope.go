@@ -497,8 +497,11 @@ func (c *Client) AcceptedStage(ctx context.Context, s *Scope) (*AcceptedStage, e
 // Submit submits the trusted observer's result manifest for acceptance
 // under the current instance and execution epoch: one result per attempt,
 // a repeat of the same bytes reenters the original stage, Control refuses
-// everything else.
-func (c *Client) Submit(ctx context.Context, s *Scope, verdict, failureCode, observer string, manifest []byte) (*Stage, error) {
+// everything else. Control records the submitting workload — this
+// sidecar, by its verified identity — as the observer (P0.2); the in-Pod
+// observer's own label is not an identity Control can verify and is not
+// sent.
+func (c *Client) Submit(ctx context.Context, s *Scope, verdict, failureCode string, manifest []byte) (*Stage, error) {
 	v, ok := verdicts[verdict]
 	if !ok {
 		return nil, fmt.Errorf("%w: INVALID_ARGUMENT unknown verdict %q", ErrRefused, verdict)
@@ -507,7 +510,7 @@ func (c *Client) Submit(ctx context.Context, s *Scope, verdict, failureCode, obs
 	req := &controlv1.AcceptResultRequest{
 		Command:   command(s.TenantID, s.AttemptID+":accept", map[string]string{"attempt": s.AttemptID, "instance": s.InstanceID, "digest": digest, "verdict": verdict}),
 		AttemptId: s.AttemptID, InstanceId: s.InstanceID, ProfileId: s.ProfileID, Verdict: v, ResultDigest: digest, ResultManifest: manifest,
-		ObserverIdentity: observer, ExecutionEpoch: s.ExecutionEpoch,
+		ObserverIdentity: ActorID, ExecutionEpoch: s.ExecutionEpoch,
 	}
 	if failureCode != "" {
 		req.FailureCode = &failureCode
@@ -574,7 +577,7 @@ type Loaded struct {
 // capability never leaves this process.
 func (c *Client) Load(ctx context.Context, s *Scope, handle string, maxBytes int64) (*Loaded, error) {
 	rctx, cancel := c.call(ctx)
-	resp, err := c.artifact.ReadArtifact(rctx, &controlv1.ReadArtifactRequest{Handle: handle, OperationId: s.OperationID, InstanceId: s.InstanceID})
+	resp, err := c.artifact.ReadArtifact(rctx, &controlv1.ReadArtifactRequest{Handle: handle, OperationId: s.OperationID, InstanceId: s.InstanceID, TenantId: s.TenantID})
 	cancel()
 	if err != nil {
 		return nil, refusal(err)
