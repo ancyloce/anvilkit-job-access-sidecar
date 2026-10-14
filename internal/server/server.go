@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	knowledgev1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/knowledge/v1"
 	mcpv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/mcp/v1"
 	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
@@ -139,6 +140,12 @@ type MCPRelay interface {
 	Call(ctx context.Context, req *mcpv1.CreateCallRequest) (*mcpv1.CreateCallResponse, error)
 }
 
+// KnowledgeRelay runs one bound retrieval at Knowledge (P2.4); nil when no
+// Knowledge placement is configured.
+type KnowledgeRelay interface {
+	Search(ctx context.Context, req *knowledgev1.SearchRequest) (*knowledgev1.SearchResponse, error)
+}
+
 // ModelRelay forwards one bound model request to the Model Proxy and copies
 // the answer to w; nil when no Proxy is configured (P11).
 type ModelRelay interface {
@@ -153,6 +160,7 @@ type Server struct {
 	Scope        ScopeSource
 	Relay        ModelRelay
 	MCP          MCPRelay
+	Knowledge    KnowledgeRelay
 	Limits       Limits
 	Log          *slog.Logger
 	Now          func() time.Time
@@ -353,6 +361,74 @@ func (s *Server) mcpCall(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// knowledgeSearch relays one retrieval of the trusted harness: the caller
+// names the snapshot, the query and the bounds; the sidecar binds the
+// confirmed scope (the operation's tenant, project and actor). Knowledge
+// decides readability for that actor and asks Control's commercial
+// authorization; nothing about withheld sources reaches the caller.
+func (s *Server) knowledgeSearch(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.Limits.MaxInputBytes))
+	if err != nil {
+		fail(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "")
+		return
+	}
+	if s.Knowledge == nil {
+		fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "knowledge upstream not configured")
+		return
+	}
+	req, err := scope.ParseSearchRequest(raw)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", "snapshotId, query, maxContextItems, retrievalProfileId and deadline only: "+err.Error())
+		return
+	}
+	sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
+	if !s.answerScopeError(w, err) {
+		return
+	}
+	bound, err := scope.BindSearch(sc, req)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+	resp, err := s.Knowledge.Search(r.Context(), bound)
+	if err != nil {
+		st := status.Convert(err)
+		code, ok := mcpStatus[st.Code()]
+		if !ok {
+			s.Log.Warn("knowledge relay failed", "code", st.Code().String())
+			fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "knowledge unreachable")
+			return
+		}
+		fail(w, code, st.Code().String(), st.Message())
+		return
+	}
+	type citation struct {
+		Ordinal        string `json:"ordinal"`
+		SourceID       string `json:"sourceId"`
+		SourceRevision string `json:"sourceRevision"`
+		ChunkID        string `json:"chunkId"`
+		Locator        string `json:"locator"`
+		ContentDigest  string `json:"contentDigest"`
+		Score          string `json:"score"`
+	}
+	type item struct {
+		Citation citation `json:"citation"`
+		Text     string   `json:"text"`
+	}
+	out := struct {
+		Items                 []item `json:"items"`
+		NoAnswer              bool   `json:"noAnswer"`
+		IndexGeneration       string `json:"indexGeneration"`
+		AuthorizationRevision string `json:"authorizationRevision"`
+	}{NoAnswer: resp.GetNoAnswer(), IndexGeneration: resp.GetIndexGeneration(), AuthorizationRevision: resp.GetAuthorizationRevision(), Items: []item{}}
+	for _, it := range resp.GetItems() {
+		c := it.GetCitation()
+		out.Items = append(out.Items, item{Text: it.GetText(), Citation: citation{Ordinal: c.GetOrdinal(), SourceID: c.GetSourceId(), SourceRevision: c.GetSourceRevision(),
+			ChunkID: c.GetChunkId(), Locator: c.GetLocator(), ContentDigest: c.GetContentDigest(), Score: c.GetScore()}})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // Trusted is the trusted route set.
 func (s *Server) Trusted() http.Handler {
 	mux := http.NewServeMux()
@@ -533,11 +609,12 @@ func (s *Server) Trusted() http.Handler {
 			fail(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", dep+" upstream not configured")
 		}
 	}
-	// The trusted harness reaches the same controlled model relay and the
-	// MCP tool-call relay (P19); the Knowledge expert relay is reserved for
-	// its unit (P16). None exists on the candidate socket.
+	// The trusted harness reaches the same controlled model relay, the MCP
+	// tool-call relay (P19) and the Knowledge retrieval relay (P2.4, the
+	// team's Retrieval specialist). None exists on the candidate socket.
 	mux.HandleFunc("POST /v1/model/relay", s.modelRelay)
-	mux.HandleFunc("POST /v1/knowledge/", unavailable("knowledge (P16)"))
+	mux.HandleFunc("POST /v1/knowledge/searches", s.knowledgeSearch)
+	mux.HandleFunc("POST /v1/knowledge/", unavailable("knowledge"))
 	mux.HandleFunc("POST /v1/mcp/calls", s.mcpCall)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "ROUTE_FORBIDDEN", "")
