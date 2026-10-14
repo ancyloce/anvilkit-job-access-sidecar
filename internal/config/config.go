@@ -113,6 +113,17 @@ type MCP struct {
 	ServerName string `koanf:"server_name"`
 }
 
+// Knowledge is the Knowledge placement of the expert retrieval relay
+// (P2.4, the team's Retrieval specialist): RetrievalService's gRPC
+// address, reached with the workload certificate under mtls (plaintext
+// DEVELOPMENT_ONLY). Without an address the relay answers
+// DEPENDENCY_UNAVAILABLE.
+type Knowledge struct {
+	Address    string        `koanf:"address"`
+	Timeout    time.Duration `koanf:"timeout"`
+	ServerName string        `koanf:"server_name"`
+}
+
 // Development is the top-level DEVELOPMENT_ONLY guard (P0.1): the
 // plaintext development identity is admitted only while it is true;
 // file-only, baked into the image as false.
@@ -136,6 +147,7 @@ type Config struct {
 	Launch          Launch        `koanf:"launch"`
 	ModelProxy      ModelProxy    `koanf:"model_proxy"`
 	MCP             MCP           `koanf:"mcp"`
+	Knowledge       Knowledge     `koanf:"knowledge"`
 	Limits          Limits        `koanf:"limits"`
 	ShutdownTimeout time.Duration `koanf:"shutdown_timeout"`
 }
@@ -152,6 +164,8 @@ var defaults = map[string]any{
 	"identity.mtls.ca_file":     "/etc/anvilkit/identity/ca.crt",
 	"identity.mtls.server_name": "anvilkit-agent-control",
 	"mcp.server_name":           "anvilkit-agent-mcp",
+	"knowledge.server_name":     "anvilkit-agent-knowledge",
+	"knowledge.timeout":         "30s",
 	"development.enabled":       false,
 	"model_proxy.timeout":       "5m",
 	"mcp.timeout":               "2m",
@@ -175,6 +189,7 @@ var envOverrides = map[string]string{
 	"ANVILKIT_SIDECAR_MODEL_PROXY_URL":   "model_proxy.url",
 	"ANVILKIT_SIDECAR_MODEL_PROXY_TOKEN": "model_proxy.token",
 	"ANVILKIT_SIDECAR_MCP_ADDRESS":       "mcp.address",
+	"ANVILKIT_SIDECAR_KNOWLEDGE_ADDRESS": "knowledge.address",
 }
 
 var launchKeyPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
