@@ -85,6 +85,16 @@ type Scope struct {
 	// subject an MCP grant is checked against; never the caller's claim).
 	ProjectID string `json:"projectId"`
 	ActorID   string `json:"actorId"`
+	// BudgetHeadroom is the operation's unreserved budget as Control read it
+	// with the scope (P2.4): what a harness sizes its concurrent sends by
+	// before the first one; nil when the operation is unfunded.
+	BudgetHeadroom *Headroom `json:"budgetHeadroom,omitempty"`
+}
+
+// Headroom is a money value in the wire form (scale-6 decimal string).
+type Headroom struct {
+	Currency string `json:"currency"`
+	Amount   string `json:"amount"`
 }
 
 // Registration is Control's answer about this Pod as of one read: the
@@ -297,7 +307,7 @@ func (c *Client) Lookup(ctx context.Context) (*Registration, error) {
 	if inst.GetPodUid() != c.identity.PodUID || inst.GetLaunchKey() != c.identity.LaunchKey || inst.GetBackend() != c.identity.Backend {
 		return nil, fmt.Errorf("%w: Control answered another registration", ErrUnavailable)
 	}
-	return &Registration{
+	reg := &Registration{
 		Scope: Scope{
 			TenantID: resp.GetTenantId(), OperationID: at.GetOperationId(), AttemptID: at.GetAttemptId(), InstanceID: inst.GetInstanceId(),
 			Current: inst.GetCurrent(), ProfileID: at.GetProfileId(), ExecutionEpoch: at.GetExecutionEpoch(), RecoveryEpoch: resp.GetRecoveryEpoch(),
@@ -305,7 +315,11 @@ func (c *Client) Lookup(ctx context.Context) (*Registration, error) {
 			ProjectID: resp.GetOperation().GetProjectId(), ActorID: resp.GetOperation().GetActorId(),
 		},
 		Instance: inst, Attempt: at, Operation: resp.GetOperation(),
-	}, nil
+	}
+	if h := resp.GetBudgetHeadroom(); h != nil {
+		reg.Scope.BudgetHeadroom = &Headroom{Currency: h.GetCurrency(), Amount: h.GetAmount()}
+	}
+	return reg, nil
 }
 
 // Confirm reads the registration now and decides its authority for the
