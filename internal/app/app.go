@@ -155,8 +155,25 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	} else {
 		log.Warn("mcp address not configured; the tool-call relay answers DEPENDENCY_UNAVAILABLE")
 	}
+	var knowledgeRelay server.KnowledgeRelay
+	if cfg.Knowledge.Address != "" {
+		var knowledgeTLS *scope.TLSFiles
+		if tlsFiles != nil {
+			t := *tlsFiles
+			t.ServerName = cfg.Knowledge.ServerName
+			knowledgeTLS = &t
+		}
+		k, err := scope.NewKnowledgeRelay(cfg.Knowledge.Address, knowledgeTLS, cfg.Knowledge.Timeout)
+		if err != nil {
+			return fmt.Errorf("knowledge relay: %w", err)
+		}
+		defer k.Close()
+		knowledgeRelay = k
+	} else {
+		log.Warn("knowledge address not configured; the retrieval relay answers DEPENDENCY_UNAVAILABLE")
+	}
 	srv := &server.Server{
-		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay, MCP: mcpRelay,
+		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay, MCP: mcpRelay, Knowledge: knowledgeRelay,
 		Limits: server.Limits{MaxInputBytes: cfg.Limits.MaxInputBytes, MaxTransferBytes: cfg.Limits.MaxTransferBytes, MaxManifestBytes: cfg.Limits.MaxManifestBytes, RequestTimeout: cfg.Limits.RequestTimeout},
 		Log:    log, Now: time.Now,
 	}

@@ -30,6 +30,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	controlv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/control/v1"
+	knowledgev1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/knowledge/v1"
 	mcpv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/mcp/v1"
 	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/app"
@@ -84,6 +85,8 @@ func TestMain(m *testing.M) {
 // attempt and the operation as of the read) and records every begin,
 // finalize and acceptance.
 type fakeControl struct {
+	// headroom is the operation's unreserved budget GetInstance answers (P2.4).
+	headroom *controlv1.Money
 	controlv1.UnimplementedExecutionServiceServer
 	controlv1.UnimplementedArtifactServiceServer
 	mu                sync.Mutex
@@ -120,6 +123,7 @@ func (f *fakeControl) GetInstance(ctx context.Context, req *controlv1.GetInstanc
 		Attempt:  &controlv1.Attempt{AttemptId: "att_1", OperationId: "op_1", ProfileId: "harness-wiring-dev-v1", ExecutionEpoch: f.atEpoch, State: f.attempt, Deadline: timestamppb.New(f.deadline)},
 		TenantId: "tenant_a", RecoveryEpoch: "1",
 	}
+	resp.BudgetHeadroom = f.headroom
 	if !f.noOperation {
 		resp.Operation = &controlv1.OperationView{OperationId: "op_1", TenantId: "tenant_a", ProjectId: "proj_a", ActorId: "user_a", Lifecycle: f.lifecycle, Control: f.control, ExecutionEpoch: f.opEpoch, Deadline: timestamppb.New(f.deadline.Add(time.Hour))}
 	}
@@ -1042,6 +1046,82 @@ func TestMCPRelayBindsTheConfirmedScope(t *testing.T) {
 	require.Equal(t, 403, stale.Status)
 	require.Equal(t, "STALE_EXECUTION", stale.Code)
 	require.Len(t, fm.reqs, 3)
+}
+
+// fakeKnowledge is Knowledge's RetrievalService: it records the bound
+// searches and answers one cited item, or the refusal it is set to.
+type fakeKnowledge struct {
+	knowledgev1.UnimplementedRetrievalServiceServer
+	mu     sync.Mutex
+	reqs   []*knowledgev1.SearchRequest
+	refuse error
+}
+
+func (f *fakeKnowledge) Search(_ context.Context, req *knowledgev1.SearchRequest) (*knowledgev1.SearchResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reqs = append(f.reqs, req)
+	if f.refuse != nil {
+		return nil, f.refuse
+	}
+	return &knowledgev1.SearchResponse{Items: []*knowledgev1.ContextItem{{Text: "teal hero", Citation: &knowledgev1.Citation{Ordinal: "1", SourceId: "src-brand", SourceRevision: "1"}}}, IndexGeneration: "1", AuthorizationRevision: "sha256:a"}, nil
+}
+
+// The Knowledge retrieval relay (P2.4, the team's Retrieval specialist):
+// the subject is the confirmed scope's (the operation's tenant, project and
+// actor), a caller-supplied scope is refused, Knowledge's refusals (a
+// commercial denial) come back as their codes, and a stale scope forwards
+// nothing.
+func TestKnowledgeRelayBindsTheConfirmedScope(t *testing.T) {
+	fk := &fakeKnowledge{}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	gs := grpc.NewServer()
+	knowledgev1.RegisterRetrievalServiceServer(gs, fk)
+	go gs.Serve(lis)
+	t.Cleanup(gs.Stop)
+	deadline := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	h := startWith(t, true, true, deadline, []string{"ANVILKIT_SIDECAR_KNOWLEDGE_ADDRESS=" + lis.Addr().String()})
+	require.Eventually(t, func() bool { return h.trusted("GET", "/v1/scope", nil, nil).Status == 200 }, 10*time.Second, 100*time.Millisecond)
+	body := `{"snapshotId":"snap_1","query":"hero colours","maxContextItems":4,"retrievalProfileId":"hybrid-bge-m3-dev-v1"}`
+	a := h.trusted("POST", "/v1/knowledge/searches", nil, []byte(body))
+	require.Equal(t, 200, a.Status, string(a.Raw))
+	require.Contains(t, string(a.Raw), `"text":"teal hero"`)
+	require.Contains(t, string(a.Raw), `"sourceId":"src-brand","sourceRevision":"1"`)
+	require.Len(t, fk.reqs, 1)
+	got := fk.reqs[0]
+	require.Equal(t, []string{"tenant_a", "proj_a", "user_a"}, []string{got.GetScope().GetTenantId(), got.GetScope().GetProjectId(), got.GetScope().GetActorId()}, "the subject is the operation's")
+	require.Equal(t, deadline.Truncate(time.Millisecond), got.GetDeadline().AsTime())
+	for name, bad := range map[string]string{
+		"a scope":     `{"snapshotId":"s","query":"q","maxContextItems":1,"retrievalProfileId":"p","scope":{"tenantId":"tenant_b"}}`,
+		"no snapshot": `{"query":"q","maxContextItems":1,"retrievalProfileId":"p"}`,
+		"too many":    `{"snapshotId":"s","query":"q","maxContextItems":65,"retrievalProfileId":"p"}`,
+	} {
+		r := h.trusted("POST", "/v1/knowledge/searches", nil, []byte(bad))
+		require.Equal(t, 400, r.Status, name)
+	}
+	require.Len(t, fk.reqs, 1, "refused requests never reach Knowledge")
+	fk.mu.Lock()
+	fk.refuse = status.Error(codes.PermissionDenied, "FORBIDDEN: commercial authorization denied")
+	fk.mu.Unlock()
+	denied := h.trusted("POST", "/v1/knowledge/searches", nil, []byte(body))
+	require.Equal(t, 403, denied.Status)
+	h.control.set(func(f *fakeControl) { f.attempt = controlv1.AttemptState_ATTEMPT_STATE_CLOSED })
+	stale := h.trusted("POST", "/v1/knowledge/searches", nil, []byte(body))
+	require.Equal(t, 403, stale.Status)
+	require.Len(t, fk.reqs, 2)
+}
+
+// The budget preflight (P2.4, TEAM-03): the scope the trusted harness reads
+// carries the operation's unreserved budget as Control read it, so the team
+// sizes its concurrent sends before the first one.
+func TestScopeCarriesTheBudgetHeadroom(t *testing.T) {
+	deadline := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	h := startWith(t, true, true, deadline, nil)
+	h.control.set(func(f *fakeControl) { f.headroom = &controlv1.Money{Currency: "USD", Amount: "1500000"} })
+	require.Eventually(t, func() bool { return h.trusted("GET", "/v1/scope", nil, nil).Status == 200 }, 10*time.Second, 100*time.Millisecond)
+	r := h.trusted("GET", "/v1/scope", nil, nil)
+	require.Contains(t, string(r.Raw), `"budgetHeadroom":{"currency":"USD","amount":"1500000"}`)
 }
 
 // confirmedClient uses the same clock-passing boundary as app.resolver.
