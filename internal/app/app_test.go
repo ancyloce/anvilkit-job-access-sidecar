@@ -252,6 +252,9 @@ func start(t *testing.T, registered, current bool, deadline time.Time) *harness 
 func startWith(t *testing.T, registered, current bool, deadline time.Time, extraEnv []string) *harness {
 	t.Helper()
 	if os.Geteuid() != 0 {
+		if os.Getenv("ANVILKIT_REQUIRE_ROOT_TESTS") != "" {
+			t.Fatal("ANVILKIT_REQUIRE_ROOT_TESTS is set: the sidecar tests spawn processes under other UIDs and must run as root")
+		}
 		t.Skip("the sidecar tests spawn processes under other UIDs and need root")
 	}
 	root, err := os.MkdirTemp("/tmp", "sidecar-")
