@@ -1,0 +1,36 @@
+# Independent verification of anvilkit-job-access-sidecar from this
+# repository alone (P3.1): formatting, build, vet, the race check, the tests
+# (the process tests spawn the sidecar as UID 10002 and a candidate as UID
+# 10001 and need root: they run under sudo and ANVILKIT_REQUIRE_ROOT_TESTS
+# turns a skip into a failure) and the image from the repository root.
+# GOWORK=off: the contract module is a versioned requirement (go.mod).
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+env:
+  GOWORK: "off"
+  GOFLAGS: "-mod=readonly"
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.27.0"
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 ./internal/config/... ./internal/envelope/... ./internal/identity/... ./internal/scope/... ./internal/server/... ./internal/sockets/...
+      - name: tests as root (the sidecar as UID 10002, a candidate as UID 10001)
+        run: sudo --preserve-env=GOWORK,GOFLAGS,HOME env "PATH=$PATH" ANVILKIT_REQUIRE_ROOT_TESTS=1 GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" go test -count=1 ./...
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker build -t anvilkit-job-access-sidecar:ci .
