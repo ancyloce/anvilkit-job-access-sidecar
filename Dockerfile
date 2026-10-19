@@ -3,7 +3,7 @@
 # module is an ordinary versioned dependency resolved through GOPROXY (the
 # declared version in go.mod). The parent's deploy/dev/images.sh uses this
 # same standalone build, without a workspace replacement.
-FROM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG GONOSUMDB=
 ENV GOWORK=off GOFLAGS=-mod=readonly CGO_ENABLED=0 GOPROXY=$GOPROXY GONOSUMDB=$GONOSUMDB
@@ -19,7 +19,7 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/anvilkit-job-access-sidecar ./cm
 # identity mode come from the Job template through the allowlisted
 # ANVILKIT_SIDECAR_* variables; workload certificates are mounted by the
 # environment. No capability is granted and none is needed.
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 RUN addgroup -g 10002 sidecar && adduser -D -H -u 10002 -G sidecar -s /sbin/nologin sidecar \
  && mkdir -p /etc/anvilkit/anvilkit-job-access-sidecar /run/anvilkit
 COPY --from=build /out/anvilkit-job-access-sidecar /usr/local/bin/anvilkit-job-access-sidecar
