@@ -1,6 +1,7 @@
 package identity_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -340,7 +341,14 @@ func TestHTTPTransportFollowsRotation(t *testing.T) {
 				return
 			}
 			go func() {
-				_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+				// Read the request before answering: closing a connection with
+				// received bytes sends a TCP reset instead of a FIN, which the
+				// client can see before the response, and a response written
+				// before the request arrives is unsolicited on an idle
+				// connection (readLoopPeekFailLocked).
+				if _, err := http.ReadRequest(bufio.NewReader(c)); err == nil {
+					_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+				}
 				c.Close()
 			}()
 		}
