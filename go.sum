@@ -5,6 +5,8 @@ github.com/ancyloce/anvilkit-agent-contracts/go v0.1.14 h1:hEVomXCk47LvMoIrTzL5e
 github.com/ancyloce/anvilkit-agent-contracts/go v0.1.14/go.mod h1:GpREiampo5pSy0+IsLQcbA+DVi6jwpweI3ojWuv/gs4=
 github.com/ancyloce/anvilkit-agent-contracts/go v0.1.15 h1:Wh7f66AOUwbcklzOrk1cbkUd+V6rnU32e8Dk8liyHnU=
 github.com/ancyloce/anvilkit-agent-contracts/go v0.1.15/go.mod h1:GpREiampo5pSy0+IsLQcbA+DVi6jwpweI3ojWuv/gs4=
+github.com/ancyloce/anvilkit-agent-contracts/go v0.1.16 h1:v0W5TcsYI/mKi6Zgheft3fUI2SlWZUIqC6ljS+7xIRo=
+github.com/ancyloce/anvilkit-agent-contracts/go v0.1.16/go.mod h1:GpREiampo5pSy0+IsLQcbA+DVi6jwpweI3ojWuv/gs4=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
 github.com/bmatcuk/doublestar v1.1.1/go.mod h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w=

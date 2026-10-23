@@ -37,5 +37,5 @@ One reviewed, secret-free `config.yaml` (baked into the image) plus the allowlis
 
 
 <!-- generated:contracts -->
-Contracts: this build requires `github.com/ancyloce/anvilkit-agent-contracts/go v0.1.15` (`go.mod`; tag `go/v0.1.15`).
+Contracts: this build requires `github.com/ancyloce/anvilkit-agent-contracts/go v0.1.16` (`go.mod`; tag `go/v0.1.16`).
 <!-- /generated:contracts -->
