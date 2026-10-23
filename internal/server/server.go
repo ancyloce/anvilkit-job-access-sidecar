@@ -124,6 +124,9 @@ type ScopeSource interface {
 	Confirm(ctx context.Context, now func() time.Time, purpose scope.Purpose) (*scope.Scope, error)
 	Upload(ctx context.Context, s *scope.Scope, class, mediaType string, body []byte) (*scope.Transfer, error)
 	Submit(ctx context.Context, s *scope.Scope, verdict, failureCode, observer string, manifest []byte) (*scope.Stage, error)
+	// Progress records the trusted coordinator's node boundary of this
+	// attempt at Control (plan 0005 Phase 2); display only, never a verdict.
+	Progress(ctx context.Context, s *scope.Scope, node, state, round, outcomeCode string) (*scope.ProgressRecord, error)
 	// AcceptedStage reads the accepted result of the attempt (nil when none).
 	AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.AcceptedStage, error)
 	// PriorStage reads the accepted stage of another attempt of the scope's
@@ -581,6 +584,39 @@ func (s *Server) Trusted() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, st)
+	})
+	// An intra-Job progress report of the trusted coordinator (plan 0005
+	// Phase 2): the node boundary, forwarded to Control under the scope's
+	// attempt, instance and epoch. Display only; a refusal changes nothing
+	// and the coordinator continues. The candidate socket has no such route.
+	mux.HandleFunc("POST /v1/progress", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Node        string `json:"node"`
+			State       string `json:"state"`
+			Round       string `json:"round"`
+			OutcomeCode string `json:"outcomeCode"`
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+		if err != nil {
+			fail(w, http.StatusRequestEntityTooLarge, "PROGRESS_TOO_LARGE", "")
+			return
+		}
+		dec := json.NewDecoder(strings.NewReader(string(body)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&in); err != nil || in.Node == "" || in.State == "" || len(in.Node) > 32 || len(in.State) > 32 || len(in.Round) > 20 || len(in.OutcomeCode) > 64 {
+			fail(w, http.StatusBadRequest, "INVALID_ARGUMENT", "node and state are required; round and outcomeCode are bounded")
+			return
+		}
+		sc, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization)
+		if !s.answerScopeError(w, err) {
+			return
+		}
+		rec, err := s.Scope.Progress(r.Context(), sc, in.Node, in.State, in.Round, in.OutcomeCode)
+		if err != nil {
+			s.answerActionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
 	})
 	// The accepted stage of this attempt (P12 joint stage recovery): read
 	// under the same authority a result submission needs, never claimed.

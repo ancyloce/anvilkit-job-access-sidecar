@@ -59,6 +59,13 @@ func (r *resolver) Submit(ctx context.Context, s *scope.Scope, verdict, failureC
 	return r.client.Submit(ctx, s, verdict, failureCode, manifest)
 }
 
+// Progress forwards the trusted coordinator's node boundary (plan 0005
+// Phase 2); the log line is diagnostic, Control's event is the record.
+func (r *resolver) Progress(ctx context.Context, s *scope.Scope, node, state, round, outcomeCode string) (*scope.ProgressRecord, error) {
+	r.log.Info("progress reported", "attemptId", s.AttemptID, "instanceId", s.InstanceID, "node", node, "state", state, "round", round, "outcomeCode", outcomeCode)
+	return r.client.Progress(ctx, s, node, state, round, outcomeCode)
+}
+
 func (r *resolver) AcceptedStage(ctx context.Context, s *scope.Scope) (*scope.AcceptedStage, error) {
 	return r.client.AcceptedStage(ctx, s)
 }

@@ -632,3 +632,33 @@ func (c *Client) Load(ctx context.Context, s *Scope, handle string, maxBytes int
 	}
 	return &Loaded{Handle: t.GetHandle(), Class: strings.ToLower(strings.TrimPrefix(t.GetClass().String(), "ARTIFACT_CLASS_")), Digest: t.GetExpectedDigest(), SizeBytes: size, Bytes: body}, nil
 }
+
+// Progress reports an intra-Job progress fact of this attempt (plan 0005
+// Phase 2): the trusted coordinator's node boundary, recorded by Control as
+// one operation.changed event under the attempt, instance and execution
+// epoch this scope confirmed. Display only: nothing here is a verdict, a
+// send or a business step; a refusal (a closed attempt, a moved epoch, a
+// fenced operation) is reported to the caller and changes nothing.
+func (c *Client) Progress(ctx context.Context, s *Scope, node, state, round, outcomeCode string) (*ProgressRecord, error) {
+	req := &controlv1.RecordAttemptProgressRequest{
+		Command:   command(s.TenantID, s.AttemptID+":progress:"+node+":"+round+":"+state, map[string]string{"attempt": s.AttemptID, "instance": s.InstanceID, "node": node, "state": state, "round": round, "outcomeCode": outcomeCode}),
+		AttemptId: s.AttemptID, InstanceId: s.InstanceID, ExecutionEpoch: s.ExecutionEpoch, Node: node, State: state, Round: round,
+	}
+	if outcomeCode != "" {
+		req.OutcomeCode = &outcomeCode
+	}
+	ctx, cancel := c.call(ctx)
+	defer cancel()
+	resp, err := c.exec.RecordAttemptProgress(ctx, req)
+	if err != nil {
+		return nil, refusal(err)
+	}
+	return &ProgressRecord{EventSeq: resp.GetEvent().GetEventSeq(), TransitionID: resp.GetEvent().GetTransitionId(), Existing: resp.GetExisting()}, nil
+}
+
+// ProgressRecord is Control's record of a progress report.
+type ProgressRecord struct {
+	EventSeq     string `json:"eventSeq"`
+	TransitionID string `json:"transitionId"`
+	Existing     bool   `json:"existing"`
+}
