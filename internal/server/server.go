@@ -232,26 +232,7 @@ var (
 // Candidate is the candidate route set.
 func (s *Server) Candidate() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/inputs/{name}", func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		if !inputName.MatchString(name) {
-			fail(w, http.StatusNotFound, "NOT_FOUND", "")
-			return
-		}
-		// Inputs are permitted only inside an execution authority Control
-		// confirms now; staged bytes are never served on an earlier answer.
-		if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
-			return
-		}
-		b, ok := s.Inputs.Get(name)
-		if !ok {
-			fail(w, http.StatusNotFound, "NOT_FOUND", "")
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Connection", "close")
-		_, _ = w.Write(b)
-	})
+	mux.HandleFunc("GET /v1/inputs/{name}", s.readInput)
 	// The controlled model relay is the candidate's only outbound route:
 	// the Model Proxy through this process, under the scope Control
 	// confirms now; there is no direct provider or network fallback.
@@ -260,6 +241,29 @@ func (s *Server) Candidate() http.Handler {
 		fail(w, http.StatusForbidden, "ROUTE_FORBIDDEN", "")
 	})
 	return s.guard(s.CandidateUID, mux)
+}
+
+// readInput serves the staged bytes of one input on both sockets; each
+// route set's guard checks the peer UID first. Inputs are served only
+// inside an execution authority Control confirms now, on every request;
+// staged bytes are never served on an earlier answer.
+func (s *Server) readInput(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !inputName.MatchString(name) {
+		fail(w, http.StatusNotFound, "NOT_FOUND", "")
+		return
+	}
+	if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
+		return
+	}
+	b, ok := s.Inputs.Get(name)
+	if !ok {
+		fail(w, http.StatusNotFound, "NOT_FOUND", "")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Connection", "close")
+	_, _ = w.Write(b)
 }
 
 // modelRelay binds the caller's request to the confirmed scope and forwards
@@ -444,24 +448,7 @@ func (s *Server) Trusted() http.Handler {
 	})
 	// The trusted harness reads staged bytes back (an input the sidecar
 	// loaded through Control) under the same authority as the candidate.
-	mux.HandleFunc("GET /v1/inputs/{name}", func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		if !inputName.MatchString(name) {
-			fail(w, http.StatusNotFound, "NOT_FOUND", "")
-			return
-		}
-		if _, err := s.Scope.Confirm(r.Context(), s.Now, scope.ForNewAuthorization); !s.answerScopeError(w, err) {
-			return
-		}
-		b, ok := s.Inputs.Get(name)
-		if !ok {
-			fail(w, http.StatusNotFound, "NOT_FOUND", "")
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Connection", "close")
-		_, _ = w.Write(b)
-	})
+	mux.HandleFunc("GET /v1/inputs/{name}", s.readInput)
 	mux.HandleFunc("PUT /v1/inputs/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.Limits.MaxInputBytes))
