@@ -34,8 +34,9 @@ type Input struct {
 	Handle string `json:"handle,omitempty"`
 }
 
-// Component is the allocated identity a launch certifies or produces
-// (P0.8; the sidecar only carries it, the Job enforces it).
+// Component is what a launch certifies or produces (P0.8): its source
+// revision and, all three or none, the allocated identity. The sidecar only
+// carries it; the Job enforces it.
 type Component struct {
 	ComponentID    string `json:"componentId"`
 	PuckType       string `json:"puckType"`

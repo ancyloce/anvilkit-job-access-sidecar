@@ -121,12 +121,12 @@ const (
 	// (a pending cancel included) refuses it.
 	ForNewAuthorization Purpose = iota
 	// ForResult: submitting the trusted observer's result. Like Control's
-	// acceptance, a cancel fence alone still lets the verdict of the
-	// running instance be recorded, and an attempt whose result was
-	// accepted still takes the same result again (Control answers the
-	// existing stage; another result conflicts there); a terminal or
-	// reconciling operation, a moved epoch, a closed attempt or a passed
-	// deadline refuses it.
+	// acceptance, a control intent alone (a cancel or a hold) still lets
+	// the verdict of the running instance be recorded, and an attempt whose
+	// result was accepted still takes the same result again (Control
+	// answers the existing stage; another result conflicts there); a
+	// terminal or reconciling operation, a moved epoch, a closed attempt or
+	// a passed deadline refuses it.
 	ForResult
 )
 
@@ -182,7 +182,7 @@ func (r *Registration) Confirm(b Binding, now time.Time, purpose Purpose) error 
 	return nil
 }
 
-// Dial options.
+// Options are the Dial options.
 type Options struct {
 	Address string
 	Timeout time.Duration
@@ -263,10 +263,12 @@ func (c *Client) call(ctx context.Context) (context.Context, context.CancelFunc)
 	return context.WithTimeout(ctx, c.timeout)
 }
 
-// refusal maps a Control status to the sidecar's errors: NotFound on the
-// instance read means unregistered; precondition/aborted/invalid answers
-// are refusals carrying Control's public code; anything else is
-// unavailable (retryable by the caller under its own bound).
+// refusal maps a Control status to the sidecar's errors: failed
+// precondition, aborted, invalid argument, not found, permission denied,
+// resource exhausted and data loss are refusals carrying Control's public
+// code (Lookup maps NotFound on the instance read to ErrUnregistered
+// before it gets here); anything else is unavailable (retryable by the
+// caller under its own bound).
 func refusal(err error) error {
 	st, ok := status.FromError(err)
 	if !ok {

@@ -15,8 +15,9 @@ import (
 )
 
 // CallRequest is what the trusted harness may send for a tool call: its
-// own command id, the grant revision, the method and the argument object.
-// The execution binding, the subject and the digests are the sidecar's.
+// own command id, the grant and its revision, the method, the argument
+// object and an optional earlier deadline. The execution binding, the
+// subject and the digests are the sidecar's.
 type CallRequest struct {
 	CommandID     string          `json:"commandId"`
 	GrantID       string          `json:"grantId"`

@@ -48,7 +48,7 @@ const (
 
 // TestMain doubles as the helper processes: "serve" runs the sidecar (as
 // UID 10002, spawned by the root test), "candidate" runs the candidate-side
-// probes (as UID 10001).
+// probes and "candidate-input" one permitted-input read (both UID 10001).
 func TestMain(m *testing.M) {
 	switch os.Getenv("SIDECAR_HELPER") {
 	case "serve":

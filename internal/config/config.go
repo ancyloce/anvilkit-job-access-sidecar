@@ -1,13 +1,16 @@
 // Package config builds the sidecar's immutable configuration snapshot with
 // koanf (A09, DD-09 §4): defaults < the reviewed config.yaml baked into the
-// image < the allowlisted ANVILKIT_SIDECAR_* environment overrides, which are
-// the deployment placements the Job template supplies (the Control address,
-// the identity mode of the environment) and the launch identity Kubernetes
-// injects (the Pod UID through the downward API, the launch key, the launch
-// backend and the typed launch envelope). Unknown keys, missing values and
+// image < the allowlisted ANVILKIT_SIDECAR_* environment overrides
+// (envOverrides), which are the deployment placements the Job template
+// supplies (the Control, Model Proxy, MCP and Knowledge addresses, the
+// identity mode of the environment), the launch identity Kubernetes
+// injects (the Pod UID through the downward API, the launch key, the
+// launch backend and the typed launch envelope), the socket directory and
+// the DEVELOPMENT_ONLY Model Proxy token. Unknown keys, missing values and
 // contradictory settings stop the process before a socket exists. The
-// launch fields are refused inside the file: they are per-Job facts, never
-// image content.
+// launch fields, the Model Proxy URL and its token are refused inside the
+// file: they are per-Job facts, placements or secrets, never image
+// content.
 package config
 
 import (

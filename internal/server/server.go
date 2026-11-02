@@ -2,8 +2,9 @@
 // sockets of DD-03 §5. Candidate routes (candidate.sock, peer UID
 // candidate) provide permitted inputs and the controlled model relay only;
 // trusted routes (trusted.sock, peer UID trusted) resolve the execution
-// scope, stage permitted inputs, run the scoped artifact transfer and
-// submit results, and reach the Knowledge/MCP expert relays. Every
+// scope, stage and load permitted inputs, run the scoped artifact
+// transfer, submit and read accepted results, report progress, and reach
+// the model relay and the Knowledge/MCP expert relays. Every
 // protected request is intersected with the execution authority Control
 // confirms at that moment: no registration, an unreachable Control, a
 // non-current instance, a closed attempt, a fenced operation or a passed
@@ -634,7 +635,8 @@ func (s *Server) Trusted() http.Handler {
 	}
 	// The trusted harness reaches the same controlled model relay, the MCP
 	// tool-call relay (P19) and the Knowledge retrieval relay (P2.4, the
-	// team's Retrieval specialist). None exists on the candidate socket.
+	// team's Retrieval specialist). Of these, only the model relay exists
+	// on the candidate socket.
 	mux.HandleFunc("POST /v1/model/relay", s.modelRelay)
 	mux.HandleFunc("POST /v1/knowledge/searches", s.knowledgeSearch)
 	mux.HandleFunc("POST /v1/knowledge/", unavailable("knowledge"))
