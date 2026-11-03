@@ -15,13 +15,15 @@ COPY internal ./internal
 RUN go build -trimpath -ldflags="-s -w" -o /out/anvilkit-job-access-sidecar ./cmd/anvilkit-job-access-sidecar
 
 # Runtime: the binary, the reviewed secret-free configuration and the
-# sidecar user (10002). The launch identity, the Control address and the
-# identity mode come from the Job template through the allowlisted
-# ANVILKIT_SIDECAR_* variables; workload certificates are mounted by the
-# environment. No capability is granted and none is needed.
+# sidecar user (10002). The launch identity (the launch secret among it,
+# DEC-045), the Control address and the identity mode come from the Job
+# template through the allowlisted ANVILKIT_SIDECAR_* variables; workload
+# certificates are mounted by the environment. The sockets are
+# abstract-namespace names: no directory is needed. No capability is
+# granted and none is needed.
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 RUN addgroup -g 10002 sidecar && adduser -D -H -u 10002 -G sidecar -s /sbin/nologin sidecar \
- && mkdir -p /etc/anvilkit/anvilkit-job-access-sidecar /run/anvilkit
+ && mkdir -p /etc/anvilkit/anvilkit-job-access-sidecar
 COPY --from=build /out/anvilkit-job-access-sidecar /usr/local/bin/anvilkit-job-access-sidecar
 COPY --chmod=0644 config.yaml /etc/anvilkit/anvilkit-job-access-sidecar/config.yaml
 ENV ANVILKIT_SIDECAR_CONFIG=/etc/anvilkit/anvilkit-job-access-sidecar/config.yaml

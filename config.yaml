@@ -6,14 +6,21 @@
 # ANVILKIT_SIDECAR_IDENTITY_MODE (the environment's placement and identity
 # mode), the Model Proxy, MCP and Knowledge placements,
 # ANVILKIT_SIDECAR_BACKEND, ANVILKIT_SIDECAR_LAUNCH_KEY,
-# ANVILKIT_SIDECAR_POD_UID (downward API metadata.uid) and
-# ANVILKIT_SIDECAR_LAUNCH_ENVELOPE (the typed launch envelope); the launch
+# ANVILKIT_SIDECAR_POD_UID (downward API metadata.uid),
+# ANVILKIT_SIDECAR_LAUNCH_ENVELOPE (the typed launch envelope) and
+# ANVILKIT_SIDECAR_LAUNCH_SECRET (the per-launch Secret's 64-hex launch
+# secret, DEC-045 B2, from which both peer tokens derive); the launch
 # facts, the Model Proxy URL and its token are refused inside this file.
 # Unknown keys fail startup. With identity.mode disabled (the default) the
 # process exits before creating a socket: a Job whose environment supplies
 # no trusted identity runs nothing.
+# sockets: the two abstract-namespace names bound inside the Pod (DEC-045;
+# a leading @, no file or directory), the trusted name for UID 0, the
+# candidate name for UID 10001; every request also carries the name's peer
+# token and every answer the sidecar's proof.
 sockets:
-  dir: /run/anvilkit/sockets
+  trusted_name: "@anvilkit/trusted"
+  candidate_name: "@anvilkit/candidate"
   trusted_uid: 0
   candidate_uid: 10001
   owner_uid: 10002
