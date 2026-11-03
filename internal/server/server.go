@@ -1,7 +1,7 @@
 // Package server serves the two route sets of the access sidecar over the
-// sockets of DD-03 §5. Candidate routes (candidate.sock, peer UID
+// abstract sockets of DD-03 §5 (DEC-045). Candidate routes (the candidate name, peer UID
 // candidate) provide permitted inputs and the controlled model relay only;
-// trusted routes (trusted.sock, peer UID trusted) resolve the execution
+// trusted routes (the trusted name, peer UID trusted) resolve the execution
 // scope, stage and load permitted inputs, run the scoped artifact
 // transfer, submit and read accepted results, report progress, and reach
 // the model relay and the Knowledge/MCP expert relays. Every
@@ -34,6 +34,7 @@ import (
 	mcpv1 "github.com/ancyloce/anvilkit-agent-contracts/go/anvilkit/mcp/v1"
 	"github.com/ancyloce/anvilkit-agent-contracts/go/modelproxyapi"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
+	peerpkg "github.com/ancyloce/anvilkit-job-access-sidecar/internal/peer"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
 )
@@ -159,15 +160,20 @@ type ModelRelay interface {
 type Server struct {
 	TrustedUID   uint32
 	CandidateUID uint32
-	Envelope     Envelope
-	Inputs       *Inputs
-	Scope        ScopeSource
-	Relay        ModelRelay
-	MCP          MCPRelay
-	Knowledge    KnowledgeRelay
-	Limits       Limits
-	Log          *slog.Logger
-	Now          func() time.Time
+	// TrustedToken and CandidateToken are the peer tokens of the two
+	// sockets (DEC-045 B2, package peer): the second binding of every
+	// request after the peer UID. Never logged.
+	TrustedToken   string
+	CandidateToken string
+	Envelope       Envelope
+	Inputs         *Inputs
+	Scope          ScopeSource
+	Relay          ModelRelay
+	MCP            MCPRelay
+	Knowledge      KnowledgeRelay
+	Limits         Limits
+	Log            *slog.Logger
+	Now            func() time.Time
 }
 
 type peerKey struct{}
@@ -212,8 +218,14 @@ func fail(w http.ResponseWriter, status int, code, reason string) {
 	writeJSON(w, status, failure{Code: code, Reason: reason})
 }
 
-// guard refuses a request whose connection is not from the expected UID.
-func (s *Server) guard(uid uint32, next http.Handler) http.Handler {
+// guard refuses a request whose connection is not from the expected UID
+// (403 PEER_UID_MISMATCH), whose nonce is missing or malformed (400
+// PEER_NONCE_INVALID) or whose peer token is not the socket's (403
+// PEER_TOKEN_MISMATCH, constant time), in that order; such refusals carry
+// no proof. A request that passes has the sidecar's proof for its nonce
+// set on the response before the route runs, so every answer of it,
+// whatever the status and including the streamed relay, carries it.
+func (s *Server) guard(uid uint32, token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, ok := peer(r)
 		if !ok || p.UID != uid {
@@ -221,6 +233,22 @@ func (s *Server) guard(uid uint32, next http.Handler) http.Handler {
 			fail(w, http.StatusForbidden, "PEER_UID_MISMATCH", "")
 			return
 		}
+		nonce := r.Header.Get(peerpkg.HeaderNonce)
+		if !peerpkg.ValidNonce(nonce) {
+			fail(w, http.StatusBadRequest, "PEER_NONCE_INVALID", "the request needs a fresh 32-hex-character "+peerpkg.HeaderNonce)
+			return
+		}
+		if !peerpkg.Equal(r.Header.Get(peerpkg.HeaderToken), token) {
+			s.Log.Warn("request with a wrong peer token refused", "peerUid", p.UID, "route", r.Method+" "+r.URL.Path)
+			fail(w, http.StatusForbidden, "PEER_TOKEN_MISMATCH", "")
+			return
+		}
+		proof, err := peerpkg.Proof(token, nonce)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "INTERNAL", "")
+			return
+		}
+		w.Header().Set(peerpkg.HeaderProof, proof)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -241,7 +269,7 @@ func (s *Server) Candidate() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "ROUTE_FORBIDDEN", "")
 	})
-	return s.guard(s.CandidateUID, mux)
+	return s.guard(s.CandidateUID, s.CandidateToken, mux)
 }
 
 // readInput serves the staged bytes of one input on both sockets; each
@@ -644,7 +672,7 @@ func (s *Server) Trusted() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "ROUTE_FORBIDDEN", "")
 	})
-	return s.guard(s.TrustedUID, mux)
+	return s.guard(s.TrustedUID, s.TrustedToken, mux)
 }
 
 // answerScopeError writes the answer for a scope that is not usable and

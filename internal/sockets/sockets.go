@@ -1,33 +1,31 @@
-// Package sockets owns the DD-03 §5 socket layout of the access sidecar:
-// one directory the sidecar creates (owner:0, 0711), trusted.sock
-// (owner:0, 0660) and candidate.sock (owner:candidate, 0660). Every
-// accepted connection is bound to the peer's kernel-reported credentials
-// (SO_PEERCRED) and refuses ancillary data: a file descriptor delegated
-// over either socket closes the connection, so neither a candidate nor a
-// trusted client can hand the sidecar (or, through it, anyone) an open
-// descriptor.
+// Package sockets owns the DD-03 §5 socket layout of the access sidecar
+// (DEC-045): two abstract-namespace Unix sockets bound inside the Pod,
+// the trusted name and the candidate name, with no file, directory or
+// mode behind them (an abstract name is scoped to the Pod's network
+// namespace or sandbox, so another Pod cannot reach it, and it works the
+// same under runc and gVisor). Every accepted connection is bound to the
+// peer's kernel-reported credentials (SO_PEERCRED) and refuses ancillary
+// data: a file descriptor delegated over either socket closes the
+// connection, so neither a candidate nor a trusted client can hand the
+// sidecar (or, through it, anyone) an open descriptor. The second binding
+// of every request, the peer token, is the server package's.
 package sockets
 
 import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
-	"syscall"
+	"strings"
 
 	"golang.org/x/sys/unix"
-)
-
-const (
-	TrustedName   = "trusted.sock"
-	CandidateName = "candidate.sock"
 )
 
 // ErrFDDelegation marks a connection that carried ancillary data.
 var ErrFDDelegation = errors.New("ancillary data (file descriptor delegation) is refused")
 
-// Peer is the kernel-reported identity of a connected process.
+// Peer is the kernel-reported identity of a connected process. The PID is
+// 0 for a peer in another PID namespace (another container of the Pod)
+// and is never a binding.
 type Peer struct {
 	UID uint32
 	GID uint32
@@ -76,10 +74,10 @@ func closeReceived(oob []byte) {
 
 // Listener accepts on one socket and answers Conns carrying peer
 // credentials. A peer whose UID is not the expected one is closed at
-// accept: the file mode already keeps it out, this is the second check.
+// accept: the first binding; the server's token check is the second.
 type Listener struct {
 	*net.UnixListener
-	Path        string
+	Name        string
 	ExpectedUID uint32
 	rejected    func(Peer)
 }
@@ -121,93 +119,47 @@ func peerOf(c *net.UnixConn) (Peer, error) {
 
 // Layout is what Create established.
 type Layout struct {
-	Dir       string
 	Trusted   *Listener
 	Candidate *Listener
 }
 
-// Create makes the directory and both sockets with the DD-03 ownership and
-// modes. It runs as the sidecar's own UID and needs no capability: the
-// directory and the sockets are created by this process, their groups are
-// set to groups this process is a member of (0 and the candidate's), and
-// the modes are set explicitly. Every step verifies the result it
-// produced, so an unexpected owner, group or mode refuses to serve rather
-// than serving on a reachable socket.
-func Create(dir string, trustedUID, candidateUID uint32, rejected func(Peer)) (*Layout, error) {
-	self := uint32(os.Getuid())
-	if err := os.MkdirAll(dir, 0o711); err != nil {
-		return nil, fmt.Errorf("sockets: mkdir %s: %w", dir, err)
+// Close closes both listeners.
+func (l *Layout) Close() {
+	if l.Trusted != nil {
+		_ = l.Trusted.Close()
 	}
-	if err := own(dir, self, 0, 0o711|os.ModeDir, true); err != nil {
-		return nil, err
+	if l.Candidate != nil {
+		_ = l.Candidate.Close()
 	}
-	for _, name := range []string{TrustedName, CandidateName} {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("sockets: remove stale %s: %w", name, err)
-		}
-	}
-	trusted, err := listen(filepath.Join(dir, TrustedName), self, 0, trustedUID, rejected)
+}
+
+// IsAbstract reports whether name is an abstract-namespace socket name:
+// a leading "@" (the NUL byte on the wire; Go's net package maps it).
+func IsAbstract(name string) bool { return strings.HasPrefix(name, "@") && len(name) > 1 }
+
+// Create binds the two abstract names. The sidecar is the Pod's native
+// sidecar and binds before any client exists; a name already held
+// (EADDRINUSE) refuses to serve rather than serving beside a squatter.
+func Create(trustedName, candidateName string, trustedUID, candidateUID uint32, rejected func(Peer)) (*Layout, error) {
+	trusted, err := listen(trustedName, trustedUID, rejected)
 	if err != nil {
 		return nil, err
 	}
-	candidate, err := listen(filepath.Join(dir, CandidateName), self, candidateUID, candidateUID, rejected)
+	candidate, err := listen(candidateName, candidateUID, rejected)
 	if err != nil {
 		_ = trusted.Close()
 		return nil, err
 	}
-	return &Layout{Dir: dir, Trusted: trusted, Candidate: candidate}, nil
+	return &Layout{Trusted: trusted, Candidate: candidate}, nil
 }
 
-func listen(path string, owner, group, expectedUID uint32, rejected func(Peer)) (*Listener, error) {
-	// A restrictive umask keeps the socket from being reachable between
-	// bind and chmod.
-	old := syscall.Umask(0o177)
-	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	syscall.Umask(old)
+func listen(name string, expectedUID uint32, rejected func(Peer)) (*Listener, error) {
+	if !IsAbstract(name) {
+		return nil, fmt.Errorf("sockets: %q is not an abstract socket name (a leading @)", name)
+	}
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: name, Net: "unix"})
 	if err != nil {
-		return nil, fmt.Errorf("sockets: listen %s: %w", path, err)
+		return nil, fmt.Errorf("sockets: listen %s: %w", name, err)
 	}
-	l.SetUnlinkOnClose(true)
-	if err := own(path, owner, group, 0o660|os.ModeSocket, false); err != nil {
-		_ = l.Close()
-		return nil, err
-	}
-	return &Listener{UnixListener: l, Path: path, ExpectedUID: expectedUID, rejected: rejected}, nil
-}
-
-// own sets group and mode and verifies owner, group and mode afterwards.
-func own(path string, owner, group uint32, mode os.FileMode, dir bool) error {
-	if err := os.Chown(path, -1, int(group)); err != nil {
-		return fmt.Errorf("sockets: chgrp %s to %d (the sidecar must be a member of that group): %w", path, group, err)
-	}
-	if err := os.Chmod(path, mode.Perm()); err != nil {
-		return fmt.Errorf("sockets: chmod %s: %w", path, err)
-	}
-	return Verify(path, owner, group, mode, dir)
-}
-
-// Verify checks that a path has exactly the expected owner, group, mode and
-// type.
-func Verify(path string, owner, group uint32, mode os.FileMode, dir bool) error {
-	st, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("sockets: stat %s: %w", path, err)
-	}
-	sys, ok := st.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("sockets: %s: no unix metadata", path)
-	}
-	if st.IsDir() != dir {
-		return fmt.Errorf("sockets: %s: unexpected file type", path)
-	}
-	if !dir && st.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("sockets: %s is not a socket", path)
-	}
-	if sys.Uid != owner || sys.Gid != group {
-		return fmt.Errorf("sockets: %s is owned by %d:%d, expected %d:%d", path, sys.Uid, sys.Gid, owner, group)
-	}
-	if st.Mode().Perm() != mode.Perm() {
-		return fmt.Errorf("sockets: %s has mode %o, expected %o", path, st.Mode().Perm(), mode.Perm())
-	}
-	return nil
+	return &Listener{UnixListener: l, Name: name, ExpectedUID: expectedUID, rejected: rejected}, nil
 }

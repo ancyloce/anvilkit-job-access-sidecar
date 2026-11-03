@@ -30,6 +30,8 @@ import (
 	"github.com/knadh/koanf/v2"
 
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/peer"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
 )
 
 const (
@@ -42,13 +44,15 @@ const (
 	IdentityMTLS        = "mtls"
 )
 
-// Sockets is the DD-03 §5 socket layout: the sidecar owns the directory and
-// both sockets; the trusted socket is reachable by the trusted UID (group 0),
-// the candidate socket by the candidate UID (group candidate).
+// Sockets is the DD-03 §5 socket layout (DEC-045): two abstract-namespace
+// names the sidecar binds inside the Pod (a leading @), the trusted name
+// answering the trusted UID, the candidate name the candidate UID; the
+// peer token of each is derived from the launch secret.
 type Sockets struct {
-	Dir          string `koanf:"dir"`
-	TrustedUID   uint32 `koanf:"trusted_uid"`
-	CandidateUID uint32 `koanf:"candidate_uid"`
+	TrustedName   string `koanf:"trusted_name"`
+	CandidateName string `koanf:"candidate_name"`
+	TrustedUID    uint32 `koanf:"trusted_uid"`
+	CandidateUID  uint32 `koanf:"candidate_uid"`
 	// OwnerUID is the UID this process must run as (10002); sockets are
 	// created under it and any other effective UID refuses to start.
 	OwnerUID uint32 `koanf:"owner_uid"`
@@ -77,12 +81,15 @@ type Identity struct {
 	MTLS MTLS   `koanf:"mtls"`
 }
 
-// Launch is the per-Job identity, environment-only.
+// Launch is the per-Job identity, environment-only. Secret is the launch
+// secret of the per-launch Kubernetes Secret (DEC-045 B2): 64 lowercase
+// hex characters from ANVILKIT_SIDECAR_LAUNCH_SECRET, never logged.
 type Launch struct {
 	Backend   string `koanf:"backend"`
 	LaunchKey string `koanf:"launch_key"`
 	PodUID    string `koanf:"pod_uid"`
 	Envelope  string `koanf:"envelope"`
+	Secret    string `koanf:"secret"`
 }
 
 // ModelProxy is the Model Proxy placement of the controlled model relay
@@ -156,7 +163,8 @@ type Config struct {
 }
 
 var defaults = map[string]any{
-	"sockets.dir":               "/run/anvilkit/sockets",
+	"sockets.trusted_name":      "@anvilkit/trusted",
+	"sockets.candidate_name":    "@anvilkit/candidate",
 	"sockets.trusted_uid":       0,
 	"sockets.candidate_uid":     10001,
 	"sockets.owner_uid":         10002,
@@ -184,7 +192,7 @@ var defaults = map[string]any{
 var envOverrides = map[string]string{
 	"ANVILKIT_SIDECAR_CONTROL_ADDRESS":   "control.address",
 	"ANVILKIT_SIDECAR_IDENTITY_MODE":     "identity.mode",
-	"ANVILKIT_SIDECAR_SOCKETS_DIR":       "sockets.dir",
+	"ANVILKIT_SIDECAR_LAUNCH_SECRET":     "launch.secret",
 	"ANVILKIT_SIDECAR_BACKEND":           "launch.backend",
 	"ANVILKIT_SIDECAR_LAUNCH_KEY":        "launch.launch_key",
 	"ANVILKIT_SIDECAR_POD_UID":           "launch.pod_uid",
@@ -214,7 +222,7 @@ func LoadFrom(path string, environ []string) (Config, error) {
 	if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
 		return Config{}, fmt.Errorf("config file %s: %w", path, err)
 	}
-	for _, key := range []string{"launch.backend", "launch.launch_key", "launch.pod_uid", "launch.envelope"} {
+	for _, key := range []string{"launch.backend", "launch.launch_key", "launch.pod_uid", "launch.envelope", "launch.secret"} {
 		if k.Exists(key) {
 			return Config{}, fmt.Errorf("config file %s: %s is a per-Job launch fact and is supplied only through the environment", path, key)
 		}
@@ -272,8 +280,18 @@ func (c Config) Disabled() bool { return c.Identity.Mode == IdentityDisabled }
 func (c Config) validate() error {
 	var errs []error
 	s := c.Sockets
-	if s.Dir == "" {
-		errs = append(errs, errors.New("sockets.dir is required"))
+	for name, v := range map[string]string{"sockets.trusted_name": s.TrustedName, "sockets.candidate_name": s.CandidateName} {
+		if !sockets.IsAbstract(v) {
+			errs = append(errs, fmt.Errorf("%s must be an abstract socket name (a leading @), got %q", name, v))
+		}
+	}
+	if s.TrustedName == s.CandidateName {
+		errs = append(errs, errors.New("sockets.trusted_name and sockets.candidate_name must differ"))
+	}
+	if !c.Disabled() {
+		if _, err := peer.ParseSecret(c.Launch.Secret); err != nil {
+			errs = append(errs, fmt.Errorf("ANVILKIT_SIDECAR_LAUNCH_SECRET (launch.secret): %w", err))
+		}
 	}
 	if s.TrustedUID == s.CandidateUID || s.OwnerUID == s.TrustedUID || s.OwnerUID == s.CandidateUID {
 		errs = append(errs, fmt.Errorf("sockets: trusted (%d), candidate (%d) and owner (%d) UIDs must differ", s.TrustedUID, s.CandidateUID, s.OwnerUID))

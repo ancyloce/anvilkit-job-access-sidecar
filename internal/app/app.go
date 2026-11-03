@@ -16,6 +16,7 @@ import (
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/config"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/identity"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/peer"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/server"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
@@ -120,12 +121,20 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return fmt.Errorf("launch envelope names launch key %s, the launch environment %s", env.LaunchKey, cfg.Launch.LaunchKey)
 	}
 
-	layout, err := sockets.Create(cfg.Sockets.Dir, cfg.Sockets.TrustedUID, cfg.Sockets.CandidateUID, func(p sockets.Peer) {
+	// DEC-045 B2: the peer tokens of both sockets from the launch secret;
+	// the secret, the tokens and the proofs are never logged.
+	secret, err := peer.ParseSecret(cfg.Launch.Secret)
+	if err != nil {
+		return fmt.Errorf("launch secret: %w", err)
+	}
+	trustedToken, candidateToken := peer.Token(secret, peer.RoleTrusted), peer.Token(secret, peer.RoleCandidate)
+	layout, err := sockets.Create(cfg.Sockets.TrustedName, cfg.Sockets.CandidateName, cfg.Sockets.TrustedUID, cfg.Sockets.CandidateUID, func(p sockets.Peer) {
 		log.Warn("connection refused at accept: unexpected peer", "peerUid", p.UID, "peerPid", p.PID)
 	})
 	if err != nil {
 		return err
 	}
+	defer layout.Close()
 	var relay server.ModelRelay
 	if cfg.ModelProxy.URL != "" {
 		o := scope.RelayOptions{URL: cfg.ModelProxy.URL, Timeout: cfg.ModelProxy.Timeout}
@@ -180,7 +189,7 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		log.Warn("knowledge address not configured; the retrieval relay answers DEPENDENCY_UNAVAILABLE")
 	}
 	srv := &server.Server{
-		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay, MCP: mcpRelay, Knowledge: knowledgeRelay,
+		TrustedUID: cfg.Sockets.TrustedUID, CandidateUID: cfg.Sockets.CandidateUID, TrustedToken: trustedToken, CandidateToken: candidateToken, Envelope: env, Inputs: server.NewInputs(env), Scope: res, Relay: relay, MCP: mcpRelay, Knowledge: knowledgeRelay,
 		Limits: server.Limits{MaxInputBytes: cfg.Limits.MaxInputBytes, MaxTransferBytes: cfg.Limits.MaxTransferBytes, MaxManifestBytes: cfg.Limits.MaxManifestBytes, RequestTimeout: cfg.Limits.RequestTimeout},
 		Log:    log, Now: time.Now,
 	}
@@ -188,7 +197,7 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	errs := make(chan error, 2)
 	go func() { errs <- trusted.Serve(layout.Trusted) }()
 	go func() { errs <- candidate.Serve(layout.Candidate) }()
-	log.Info("access sidecar serving", "dir", layout.Dir, "launchKey", cfg.Launch.LaunchKey, "backend", cfg.Launch.Backend, "identity", cfg.Identity.Mode, "modelRelay", relay != nil, "mcpRelay", mcpRelay != nil)
+	log.Info("access sidecar serving", "trustedSocket", cfg.Sockets.TrustedName, "candidateSocket", cfg.Sockets.CandidateName, "launchKey", cfg.Launch.LaunchKey, "backend", cfg.Launch.Backend, "identity", cfg.Identity.Mode, "modelRelay", relay != nil, "mcpRelay", mcpRelay != nil)
 
 	select {
 	case <-ctx.Done():

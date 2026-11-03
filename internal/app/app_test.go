@@ -36,6 +36,7 @@ import (
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/app"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/config"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/envelope"
+	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/peer"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/scope"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/server"
 	"github.com/ancyloce/anvilkit-job-access-sidecar/internal/sockets"
@@ -70,11 +71,11 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	case "candidate":
-		candidateProbes(os.Getenv("SIDECAR_DIR"), os.Getenv("SIDECAR_INPUT"))
+		candidateProbes(os.Getenv("SIDECAR_TRUSTED"), os.Getenv("SIDECAR_CANDIDATE"), os.Getenv("SIDECAR_TOKEN"), os.Getenv("SIDECAR_INPUT"))
 		os.Exit(0)
 	case "candidate-input":
 		// One permitted-input read as UID 10001: prints "<status> <code>".
-		fmt.Print(candidateInput(os.Getenv("SIDECAR_DIR"), os.Getenv("SIDECAR_INPUT")))
+		fmt.Print(candidateInput(os.Getenv("SIDECAR_CANDIDATE"), os.Getenv("SIDECAR_TOKEN"), os.Getenv("SIDECAR_INPUT")))
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -223,13 +224,16 @@ func (b *logBuffer) String() string {
 }
 
 type harness struct {
-	t       *testing.T
-	dir     string // sockets dir
-	control *fakeControl
-	sidecar *exec.Cmd
-	stdin   io.WriteCloser
-	helper  string
-	stderr  logBuffer
+	t *testing.T
+	// The abstract socket names of this sidecar (unique per test) and the
+	// peer tokens derived from the launch secret (DEC-045 B2).
+	trustedName, candidateName   string
+	trustedToken, candidateToken string
+	control                      *fakeControl
+	sidecar                      *exec.Cmd
+	stdin                        io.WriteCloser
+	helper                       string
+	stderr                       logBuffer
 	// controlAddr and serve restart the fake Control on the same address
 	// after it was stopped (the unavailable-Control scenario).
 	controlAddr string
@@ -240,6 +244,13 @@ type harness struct {
 const envelopeJSON = `{"schemaVersion":1,"launchId":"lch_1","launchKey":"cg-test","operationId":"op_1","attemptId":"att_1","profileId":"harness-wiring-dev-v1","profileRevision":"1","jobKind":"codegen","executionEpoch":"1","launchEpoch":"1","deadline":"2030-01-01T00:00:00Z","inputs":[{"name":"fixed-input","digest":"sha256:abeb263b000189efdd8206ff39eeb4f2f7f3217f1c480491868b46da4a21c6a8"}]}`
 
 const fixedInput = "anvilkit-codegen-fixed-v1 input\n"
+
+// testSecret is the launch secret the launcher would issue; the tokens of
+// both sockets derive from it.
+const testSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// socketSerial makes the abstract socket names unique per sidecar process.
+var socketSerial atomic.Int32
 
 // start runs a fake Control, a fake object store and the sidecar as UID
 // 10002 with supplementary groups 0 and 10001 in a world-traversable
@@ -267,10 +278,10 @@ func startWith(t *testing.T, registered, current bool, deadline time.Time, extra
 	require.NoError(t, err)
 	helper := filepath.Join(root, "helper")
 	require.NoError(t, os.WriteFile(helper, raw, 0o755))
-	// The volume the sidecar owns its directory in: an emptyDir is 0777.
-	volume := filepath.Join(root, "run")
-	require.NoError(t, os.Mkdir(volume, 0o777))
-	require.NoError(t, os.Chmod(volume, 0o777))
+	serial := socketSerial.Add(1)
+	trustedName, candidateName := fmt.Sprintf("@anvilkit-test/%d-%d/trusted", os.Getpid(), serial), fmt.Sprintf("@anvilkit-test/%d-%d/candidate", os.Getpid(), serial)
+	secret, err := peer.ParseSecret(testSecret)
+	require.NoError(t, err)
 
 	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -286,7 +297,8 @@ func startWith(t *testing.T, registered, current bool, deadline time.Time, extra
 		transfers: map[string]*controlv1.Transfer{}, finalized: map[string]bool{}, stages: map[string]string{}, stageDigest: map[string]string{}, uploadURL: store.URL + "/object"}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	h := &harness{t: t, dir: filepath.Join(volume, "sockets"), control: fc, helper: helper, controlAddr: lis.Addr().String()}
+	h := &harness{t: t, trustedName: trustedName, candidateName: candidateName, trustedToken: peer.Token(secret, peer.RoleTrusted), candidateToken: peer.Token(secret, peer.RoleCandidate),
+		control: fc, helper: helper, controlAddr: lis.Addr().String()}
 	h.serve = func() *grpc.Server {
 		srv := grpc.NewServer()
 		controlv1.RegisterExecutionServiceServer(srv, fc)
@@ -299,10 +311,10 @@ func startWith(t *testing.T, registered, current bool, deadline time.Time, extra
 	t.Cleanup(func() { h.srv.Stop() })
 
 	cfgPath := filepath.Join(root, "config.yaml")
-	require.NoError(t, os.WriteFile(cfgPath, []byte("development:\n  enabled: true\ncontrol:\n  timeout: 5s\nidentity:\n  mode: development\n"), 0o644))
+	require.NoError(t, os.WriteFile(cfgPath, []byte("development:\n  enabled: true\ncontrol:\n  timeout: 5s\nidentity:\n  mode: development\nsockets:\n  trusted_name: \""+trustedName+"\"\n  candidate_name: \""+candidateName+"\"\n"), 0o644))
 	cmd := exec.Command(helper)
 	cmd.Env = []string{"SIDECAR_HELPER=serve", "ANVILKIT_SIDECAR_CONFIG=" + cfgPath, "ANVILKIT_SIDECAR_CONTROL_ADDRESS=" + h.controlAddr,
-		"ANVILKIT_SIDECAR_SOCKETS_DIR=" + h.dir, "ANVILKIT_SIDECAR_BACKEND=test-backend", "ANVILKIT_SIDECAR_LAUNCH_KEY=cg-test", "ANVILKIT_SIDECAR_POD_UID=pod-1", "ANVILKIT_SIDECAR_LAUNCH_ENVELOPE=" + envelopeJSON}
+		"ANVILKIT_SIDECAR_LAUNCH_SECRET=" + testSecret, "ANVILKIT_SIDECAR_BACKEND=test-backend", "ANVILKIT_SIDECAR_LAUNCH_KEY=cg-test", "ANVILKIT_SIDECAR_POD_UID=pod-1", "ANVILKIT_SIDECAR_LAUNCH_ENVELOPE=" + envelopeJSON}
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: sidecarUID, Gid: sidecarUID, Groups: []uint32{0, candidateUID}}}
 	stdin, err := cmd.StdinPipe()
@@ -325,8 +337,13 @@ func startWith(t *testing.T, registered, current bool, deadline time.Time, extra
 	})
 	_ = srv
 	require.Eventually(t, func() bool {
-		st, err := os.Lstat(filepath.Join(h.dir, "candidate.sock"))
-		return err == nil && st.Mode()&os.ModeSocket != 0
+		// An abstract name has no file: the sidecar is up once a connect
+		// succeeds (the root caller is closed at accept, which is fine).
+		c, err := net.DialTimeout("unix", h.candidateName, time.Second)
+		if err == nil {
+			c.Close()
+		}
+		return err == nil
 	}, 10*time.Second, 50*time.Millisecond, "sidecar did not open its sockets: %s", h.stderr.String())
 	return h
 }
@@ -336,14 +353,29 @@ type answer struct {
 	Code   string
 	Body   map[string]any
 	Raw    []byte
+	// Proof reports whether the answer carried the sidecar's proof of the
+	// request's nonce under the token the request sent.
+	Proof bool
 }
 
-// trusted sends one request over a fresh connection to trusted.sock.
+// trusted sends one request over a fresh connection to the trusted name
+// with the trusted token; every answer past the guard must carry the proof.
 func (h *harness) trusted(method, path string, headers map[string]string, body []byte) answer {
-	return call(h.t, filepath.Join(h.dir, "trusted.sock"), method, path, headers, body)
+	h.t.Helper()
+	a := call(h.t, h.trustedName, h.trustedToken, method, path, headers, body)
+	require.True(h.t, a.Proof, "%s %s answered %d without the sidecar's proof", method, path, a.Status)
+	return a
 }
 
-func call(t *testing.T, socket, method, path string, headers map[string]string, body []byte) answer {
+// peerHeaders are the DEC-045 request headers for a token and a fresh nonce.
+func peerHeaders(t *testing.T, token string) (map[string]string, string) {
+	t.Helper()
+	nonce, err := peer.NewNonce()
+	require.NoError(t, err)
+	return map[string]string{peer.HeaderToken: token, peer.HeaderNonce: nonce}, nonce
+}
+
+func call(t *testing.T, socket, token, method, path string, headers map[string]string, body []byte) answer {
 	t.Helper()
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
@@ -351,6 +383,10 @@ func call(t *testing.T, socket, method, path string, headers map[string]string, 
 	c := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 	req, err := http.NewRequest(method, "http://sidecar"+path, bytes.NewReader(body))
 	require.NoError(t, err)
+	ph, nonce := peerHeaders(t, token)
+	for k, v := range ph {
+		req.Header.Set(k, v)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -361,26 +397,67 @@ func call(t *testing.T, socket, method, path string, headers map[string]string, 
 	a := answer{Status: resp.StatusCode, Raw: raw}
 	_ = json.Unmarshal(raw, &a.Body)
 	a.Code, _ = a.Body["code"].(string)
+	if want, err := peer.Proof(token, nonce); err == nil {
+		a.Proof = peer.Equal(resp.Header.Get(peer.HeaderProof), want)
+	}
 	return a
 }
 
-func ownership(t *testing.T, path string) (uid, gid uint32, mode os.FileMode) {
+// rawRequest is one HTTP/1.1 request as bytes with the peer headers.
+func rawRequest(t *testing.T, token, method, path string) []byte {
 	t.Helper()
-	st, err := os.Lstat(path)
-	require.NoError(t, err)
-	sys := st.Sys().(*syscall.Stat_t)
-	return sys.Uid, sys.Gid, st.Mode().Perm()
+	ph, _ := peerHeaders(t, token)
+	return []byte(method + " " + path + " HTTP/1.1\r\nHost: sidecar\r\n" + peer.HeaderToken + ": " + ph[peer.HeaderToken] + "\r\n" + peer.HeaderNonce + ": " + ph[peer.HeaderNonce] + "\r\n\r\n")
 }
 
-// The socket layout carries the DD-03 ownership and modes.
-func TestSocketLayout(t *testing.T) {
+// The sockets are abstract names (DEC-045): no file anywhere, reachable
+// by name inside the namespace, and the sidecar refuses to serve beside a
+// squatter.
+func TestAbstractSocketNames(t *testing.T) {
 	h := start(t, true, true, time.Now().Add(time.Hour))
-	uid, gid, mode := ownership(t, h.dir)
-	require.Equal(t, [3]any{uint32(sidecarUID), uint32(0), os.FileMode(0o711)}, [3]any{uid, gid, mode}, "directory owner:0 0711")
-	uid, gid, mode = ownership(t, filepath.Join(h.dir, "trusted.sock"))
-	require.Equal(t, [3]any{uint32(sidecarUID), uint32(0), os.FileMode(0o660)}, [3]any{uid, gid, mode}, "trusted.sock owner:0 0660")
-	uid, gid, mode = ownership(t, filepath.Join(h.dir, "candidate.sock"))
-	require.Equal(t, [3]any{uint32(sidecarUID), uint32(candidateUID), os.FileMode(0o660)}, [3]any{uid, gid, mode}, "candidate.sock owner:candidate 0660")
+	require.True(t, strings.HasPrefix(h.trustedName, "@") && strings.HasPrefix(h.candidateName, "@"))
+	_, err := os.Lstat(strings.TrimPrefix(h.trustedName, "@"))
+	require.True(t, os.IsNotExist(err), "no socket file exists")
+	require.Equal(t, 200, h.trusted("GET", "/v1/scope", nil, nil).Status)
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: h.trustedName, Net: "unix"})
+	if err == nil {
+		l.Close()
+	}
+	require.Error(t, err, "the held name cannot be bound again")
+	require.Contains(t, h.stderr.String(), `"trustedSocket":"`+h.trustedName+`"`, "the serving line names the sockets, never the secret")
+	require.NotContains(t, h.stderr.String(), testSecret)
+	require.NotContains(t, h.stderr.String(), h.trustedToken)
+}
+
+// The second peer binding (DEC-045 B2) on the trusted socket: the right
+// token with a nonce is served with the proof, whatever the status past the
+// guard; a wrong token, the candidate's token, no token or no nonce is
+// refused without a proof and before Control is asked.
+func TestPeerTokenBinding(t *testing.T) {
+	h := start(t, true, true, time.Now().Add(time.Hour))
+	require.Eventually(t, func() bool { return h.trusted("GET", "/v1/scope", nil, nil).Status == 200 }, 10*time.Second, 100*time.Millisecond)
+	lookups := h.control.lookups.Load()
+	a := call(t, h.trustedName, h.candidateToken, "GET", "/v1/scope", nil, nil)
+	require.Equal(t, 403, a.Status)
+	require.Equal(t, "PEER_TOKEN_MISMATCH", a.Code)
+	require.False(t, a.Proof, "a guard refusal carries no proof")
+	a = call(t, h.trustedName, strings.Repeat("00", 32), "GET", "/v1/scope", nil, nil)
+	require.Equal(t, "PEER_TOKEN_MISMATCH", a.Code)
+	a = call(t, h.trustedName, "", "GET", "/v1/scope", nil, nil)
+	require.Equal(t, "PEER_TOKEN_MISMATCH", a.Code, "no token")
+	a = call(t, h.trustedName, h.trustedToken, "GET", "/v1/scope", map[string]string{peer.HeaderNonce: ""}, nil)
+	require.Equal(t, 400, a.Status)
+	require.Equal(t, "PEER_NONCE_INVALID", a.Code)
+	require.False(t, a.Proof)
+	a = call(t, h.trustedName, h.trustedToken, "GET", "/v1/scope", map[string]string{peer.HeaderNonce: "ABCDEF"}, nil)
+	require.Equal(t, "PEER_NONCE_INVALID", a.Code, "a malformed nonce")
+	require.Equal(t, lookups, h.control.lookups.Load(), "guard refusals never reach Control")
+	a = h.trusted("GET", "/v1/inputs/undeclared", nil, nil)
+	require.Equal(t, 404, a.Status)
+	require.True(t, a.Proof, "a 4xx past the guard carries the proof")
+	a = h.trusted("GET", "/v1/scope", nil, nil)
+	require.Equal(t, 200, a.Status)
+	require.True(t, a.Proof)
 }
 
 // Trusted routes answer the scope only once the launcher registered the
@@ -645,10 +722,10 @@ func TestControlWithoutOperationStateAuthorizesNothing(t *testing.T) {
 // connection is not answered.
 func TestOneRequestPerTrustedConnection(t *testing.T) {
 	h := start(t, true, true, time.Now().Add(time.Hour))
-	conn, err := net.Dial("unix", filepath.Join(h.dir, "trusted.sock"))
+	conn, err := net.Dial("unix", h.trustedName)
 	require.NoError(t, err)
 	defer conn.Close()
-	_, err = conn.Write([]byte("GET /v1/scope HTTP/1.1\r\nHost: sidecar\r\n\r\nGET /v1/scope HTTP/1.1\r\nHost: sidecar\r\n\r\n"))
+	_, err = conn.Write(append(rawRequest(t, h.trustedToken, "GET", "/v1/scope"), rawRequest(t, h.trustedToken, "GET", "/v1/scope")...))
 	require.NoError(t, err)
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	raw, _ := io.ReadAll(conn)
@@ -656,23 +733,24 @@ func TestOneRequestPerTrustedConnection(t *testing.T) {
 	require.Contains(t, string(raw), "Connection: close")
 }
 
-// The root test process can open candidate.sock (it holds DAC override):
-// the peer credential check still refuses it, and a descriptor delegated
-// over trusted.sock closes the connection unserved.
+// The root test process can connect to the candidate name (an abstract
+// name has no mode): the peer credential check still closes it at accept,
+// and a descriptor delegated over the trusted name closes the connection
+// unserved.
 func TestPeerCredentialsAndDelegation(t *testing.T) {
 	h := start(t, true, true, time.Now().Add(time.Hour))
-	conn, err := net.Dial("unix", filepath.Join(h.dir, "candidate.sock"))
+	conn, err := net.Dial("unix", h.candidateName)
 	require.NoError(t, err)
-	_, _ = conn.Write([]byte("GET /v1/inputs/fixed-input HTTP/1.1\r\nHost: sidecar\r\n\r\n"))
+	_, _ = conn.Write(rawRequest(t, h.candidateToken, "GET", "/v1/inputs/fixed-input"))
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	raw, _ := io.ReadAll(conn)
 	conn.Close()
 	require.Empty(t, raw, "uid 0 on the candidate socket is closed at accept")
 
-	uc, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: filepath.Join(h.dir, "trusted.sock"), Net: "unix"})
+	uc, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: h.trustedName, Net: "unix"})
 	require.NoError(t, err)
 	f, _ := os.Open(os.DevNull)
-	_, _, err = uc.WriteMsgUnix([]byte("GET /v1/scope HTTP/1.1\r\nHost: sidecar\r\n\r\n"), unix.UnixRights(int(f.Fd())), nil)
+	_, _, err = uc.WriteMsgUnix(rawRequest(t, h.trustedToken, "GET", "/v1/scope"), unix.UnixRights(int(f.Fd())), nil)
 	f.Close()
 	require.NoError(t, err)
 	_ = uc.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -690,14 +768,16 @@ func TestCandidateBoundary(t *testing.T) {
 	require.Eventually(t, func() bool { return h.trusted("GET", "/v1/scope", nil, nil).Status == 200 }, 10*time.Second, 100*time.Millisecond)
 	a := h.trusted("PUT", "/v1/inputs/fixed-input", nil, []byte(fixedInput))
 	require.Equal(t, 200, a.Status)
-	cmd := exec.Command(h.helper)
-	cmd.Env = []string{"SIDECAR_HELPER=candidate", "SIDECAR_DIR=" + h.dir, "SIDECAR_INPUT=fixed-input"}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: candidateUID, Gid: candidateUID, Groups: []uint32{}}}
+	cmd := h.candidateHelper("candidate", "fixed-input")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 	var rep map[string]string
 	require.NoError(t, json.Unmarshal(out, &rep), string(out))
-	require.Equal(t, "EACCES", rep["connect:trusted.sock"], "the candidate cannot open the trusted socket")
+	require.Equal(t, "CONNECTED", rep["connect:trusted"], "an abstract name has no mode: the candidate connects")
+	require.Equal(t, "CLOSED", rep["trusted:scope"], "and the peer credential check closes it at accept, unanswered")
+	require.Equal(t, "403 PEER_TOKEN_MISMATCH", rep["candidate:wrong-token"], "the trusted token is not the candidate socket's")
+	require.Equal(t, "400 PEER_NONCE_INVALID", rep["candidate:no-nonce"])
+	require.Equal(t, "ok", rep["candidate:proof"], "every served answer carried the sidecar's proof")
 	require.Equal(t, "200 ", rep["candidate:inputs-permitted"])
 	require.Equal(t, "404 NOT_FOUND", rep["candidate:inputs-other"])
 	require.Equal(t, "403 ROUTE_FORBIDDEN", rep["candidate:scope"])
@@ -711,34 +791,63 @@ func TestCandidateBoundary(t *testing.T) {
 	require.Equal(t, 0, h.control.accepts, "no candidate request reached Control")
 }
 
+// candidateHelper is the helper process as UID 10001 with the socket names
+// and the candidate token (never the secret) in its environment.
+func (h *harness) candidateHelper(mode, input string) *exec.Cmd {
+	cmd := exec.Command(h.helper)
+	cmd.Env = []string{"SIDECAR_HELPER=" + mode, "SIDECAR_TRUSTED=" + h.trustedName, "SIDECAR_CANDIDATE=" + h.candidateName, "SIDECAR_TOKEN=" + h.candidateToken, "SIDECAR_INPUT=" + input}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: candidateUID, Gid: candidateUID, Groups: []uint32{}}}
+	return cmd
+}
+
 // candidateRead performs one permitted-input read as UID 10001 and
 // returns "<status> <code>".
 func (h *harness) candidateRead(input string) string {
 	h.t.Helper()
-	cmd := exec.Command(h.helper)
-	cmd.Env = []string{"SIDECAR_HELPER=candidate-input", "SIDECAR_DIR=" + h.dir, "SIDECAR_INPUT=" + input}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: candidateUID, Gid: candidateUID, Groups: []uint32{}}}
-	out, err := cmd.CombinedOutput()
+	out, err := h.candidateHelper("candidate-input", input).CombinedOutput()
 	require.NoError(h.t, err, string(out))
 	return strings.TrimSpace(string(out))
 }
 
-func candidateInput(dir, input string) string {
-	socket := filepath.Join(dir, "candidate.sock")
+// peerRequest sends one request with the peer headers over a fresh
+// connection and returns the answer with whether its proof verified.
+func peerRequest(socket, token, method, path, body string, headers map[string]string, timeout time.Duration) (*http.Response, []byte, bool, error) {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}, DisableKeepAlives: true}
-	c := &http.Client{Transport: tr, Timeout: 10 * time.Second}
-	resp, err := c.Get("http://sidecar/v1/inputs/" + input)
+	c := &http.Client{Transport: tr, Timeout: timeout}
+	req, _ := http.NewRequest(method, "http://sidecar"+path, strings.NewReader(body))
+	nonce, _ := peer.NewNonce()
+	req.Header.Set(peer.HeaderToken, token)
+	req.Header.Set(peer.HeaderNonce, nonce)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.Do(req)
 	if err != nil {
-		return "ERR " + err.Error()
+		return nil, nil, false, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	proved := false
+	if want, err := peer.Proof(token, nonce); err == nil {
+		proved = peer.Equal(resp.Header.Get(peer.HeaderProof), want)
+	}
+	return resp, raw, proved, nil
+}
+
+func candidateInput(socket, token, input string) string {
+	resp, raw, proved, err := peerRequest(socket, token, "GET", "/v1/inputs/"+input, "", nil, 10*time.Second)
+	if err != nil {
+		return "ERR " + err.Error()
+	}
 	var f struct {
 		Code string `json:"code"`
 	}
 	_ = json.Unmarshal(raw, &f)
+	if !proved {
+		return fmt.Sprintf("%d NOPROOF", resp.StatusCode)
+	}
 	if resp.StatusCode == 200 {
 		return fmt.Sprintf("200 %d", len(raw))
 	}
@@ -746,7 +855,7 @@ func candidateInput(dir, input string) string {
 }
 
 // candidateProbes is the UID 10001 helper.
-func candidateProbes(dir, input string) {
+func candidateProbes(trusted, candidate, token, input string) {
 	rep := map[string]string{}
 	errString := func(err error) string {
 		for {
@@ -763,33 +872,45 @@ func candidateProbes(dir, input string) {
 			return err.Error()
 		}
 	}
-	if c, err := net.DialTimeout("unix", filepath.Join(dir, "trusted.sock"), 2*time.Second); err == nil {
+	if c, err := net.DialTimeout("unix", trusted, 2*time.Second); err == nil {
 		c.Close()
-		rep["connect:trusted.sock"] = "CONNECTED"
+		rep["connect:trusted"] = "CONNECTED"
 	} else {
-		rep["connect:trusted.sock"] = errString(err)
+		rep["connect:trusted"] = errString(err)
 	}
-	socket := filepath.Join(dir, "candidate.sock")
-	ask := func(key, method, path, body string) []byte {
-		tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		}, DisableKeepAlives: true}
-		c := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-		req, _ := http.NewRequest(method, "http://sidecar"+path, strings.NewReader(body))
-		resp, err := c.Do(req)
+	socket := candidate
+	rep["candidate:proof"] = "ok"
+	askWith := func(key, sock, tok, method, path, body string, headers map[string]string, proofExpected bool) []byte {
+		resp, raw, proved, err := peerRequest(sock, tok, method, path, body, headers, 5*time.Second)
 		if err != nil {
-			rep[key] = errString(err)
+			// Closed at accept: EOF, a reset or a broken pipe, depending on
+			// whether the close landed before or during the write.
+			if m := err.Error(); strings.HasSuffix(m, "EOF") || strings.Contains(m, "broken pipe") || strings.Contains(m, "connection reset") {
+				rep[key] = "CLOSED"
+			} else {
+				rep[key] = errString(err)
+			}
 			return nil
 		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
 		var f struct {
 			Code string `json:"code"`
 		}
 		_ = json.Unmarshal(raw, &f)
 		rep[key] = fmt.Sprintf("%d %s", resp.StatusCode, f.Code)
+		if proofExpected && !proved {
+			rep["candidate:proof"] = "missing on " + key
+		}
 		return raw
 	}
+	ask := func(key, method, path, body string) []byte {
+		return askWith(key, socket, token, method, path, body, nil, true)
+	}
+	// The trusted name connects (no file mode) but the candidate's UID is
+	// closed at accept: no answer at all (reported CLOSED).
+	askWith("trusted:scope", trusted, token, "GET", "/v1/scope", "", nil, false)
+	// The second binding on the candidate's own socket.
+	askWith("candidate:wrong-token", socket, strings.Repeat("00", 32), "GET", "/v1/inputs/"+input, "", nil, false)
+	askWith("candidate:no-nonce", socket, token, "GET", "/v1/inputs/"+input, "", map[string]string{peer.HeaderNonce: ""}, false)
 	rep["candidate:input-bytes"] = string(ask("candidate:inputs-permitted", "GET", "/v1/inputs/"+input, ""))
 	ask("candidate:inputs-other", "GET", "/v1/inputs/not-permitted", "")
 	ask("candidate:scope", "GET", "/v1/scope", "")
@@ -805,7 +926,8 @@ func candidateProbes(dir, input string) {
 		rep["candidate:fd-delegation"] = errString(err)
 	} else {
 		f, _ := os.Open(os.DevNull)
-		_, _, _ = uc.WriteMsgUnix([]byte("GET /v1/inputs/"+input+" HTTP/1.1\r\nHost: sidecar\r\n\r\n"), unix.UnixRights(int(f.Fd())), nil)
+		nonce, _ := peer.NewNonce()
+		_, _, _ = uc.WriteMsgUnix([]byte("GET /v1/inputs/"+input+" HTTP/1.1\r\nHost: sidecar\r\n"+peer.HeaderToken+": "+token+"\r\n"+peer.HeaderNonce+": "+nonce+"\r\n\r\n"), unix.UnixRights(int(f.Fd())), nil)
 		f.Close()
 		_ = uc.SetReadDeadline(time.Now().Add(3 * time.Second))
 		raw, _ := io.ReadAll(uc)
@@ -946,13 +1068,11 @@ func TestModelRelayBindsTheConfirmedScope(t *testing.T) {
 	require.Len(t, proxy.recorded(), 4, "refused requests never reach the Proxy")
 
 	// The candidate socket relays under the same binding; its own binding is refused.
-	cmd := exec.Command(h.helper)
-	cmd.Env = []string{"SIDECAR_HELPER=candidate", "SIDECAR_DIR=" + h.dir, "SIDECAR_INPUT=fixed-input"}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: candidateUID, Gid: candidateUID, Groups: []uint32{}}}
-	out, err := cmd.CombinedOutput()
+	out, err := h.candidateHelper("candidate", "fixed-input").CombinedOutput()
 	require.NoError(t, err, string(out))
 	var rep map[string]string
 	require.NoError(t, json.Unmarshal(out, &rep), string(out))
+	require.Equal(t, "ok", rep["candidate:proof"])
 	require.Equal(t, "400 INVALID_ARGUMENT", rep["candidate:model-relay"], "an empty relay request")
 	require.Equal(t, "200 ", rep["candidate:model-relay-bound"])
 	require.Contains(t, rep["candidate:model-relay-frames"], `"text":"relayed"`)
@@ -1167,7 +1287,10 @@ func TestLookupCrossingDeadlineServesNothing(t *testing.T) {
 			require.NoError(t, err)
 			inputs := server.NewInputs(env)
 			require.NoError(t, inputs.Stage("fixed-input", []byte(fixedInput)))
-			srv := &server.Server{TrustedUID: 0, CandidateUID: candidateUID, Envelope: env, Inputs: inputs, Scope: confirmedClient{client}, Log: slog.Default(), Now: func() time.Time { return time.Unix(0, clock.Load()) }}
+			secret, err := peer.ParseSecret(testSecret)
+			require.NoError(t, err)
+			trustedToken, candidateToken := peer.Token(secret, peer.RoleTrusted), peer.Token(secret, peer.RoleCandidate)
+			srv := &server.Server{TrustedUID: 0, CandidateUID: candidateUID, TrustedToken: trustedToken, CandidateToken: candidateToken, Envelope: env, Inputs: inputs, Scope: confirmedClient{client}, Log: slog.Default(), Now: func() time.Time { return time.Unix(0, clock.Load()) }}
 			for _, candidate := range []bool{false, true} {
 				for _, crossed := range []bool{false, true} {
 					clock.Store(start.UnixNano())
@@ -1178,12 +1301,15 @@ func TestLookupCrossingDeadlineServesNothing(t *testing.T) {
 							}
 						}
 					})
-					path, uid, handler := "/v1/scope", uint32(0), srv.Trusted()
+					path, uid, handler, token := "/v1/scope", uint32(0), srv.Trusted(), trustedToken
 					if candidate {
-						path, uid, handler = "/v1/inputs/fixed-input", candidateUID, srv.Candidate()
+						path, uid, handler, token = "/v1/inputs/fixed-input", candidateUID, srv.Candidate(), candidateToken
 					}
 					ctx := server.ConnContext(context.Background(), &sockets.Conn{Peer: sockets.Peer{UID: uid}})
 					req := httptest.NewRequest("GET", path, nil).WithContext(ctx)
+					for k, v := range map[string]string{peer.HeaderToken: token, peer.HeaderNonce: strings.Repeat("ab", 16)} {
+						req.Header.Set(k, v)
+					}
 					resp := httptest.NewRecorder()
 					handler.ServeHTTP(resp, req)
 					if crossed {
