@@ -21,7 +21,7 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/anvilkit-job-access-sidecar ./cm
 # certificates are mounted by the environment. The sockets are
 # abstract-namespace names: no directory is needed. No capability is
 # granted and none is needed.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:3f4d6b32e26703c6082839234f43769d5046b3ac7c910033911d1e71d8cd630a
 RUN addgroup -g 10002 sidecar && adduser -D -H -u 10002 -G sidecar -s /sbin/nologin sidecar \
  && mkdir -p /etc/anvilkit/anvilkit-job-access-sidecar
 COPY --from=build /out/anvilkit-job-access-sidecar /usr/local/bin/anvilkit-job-access-sidecar
