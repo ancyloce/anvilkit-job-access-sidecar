@@ -22,6 +22,10 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/anvilkit-job-access-sidecar ./cm
 # abstract-namespace names: no directory is needed. No capability is
 # granted and none is needed.
 FROM alpine:3.24@sha256:3f4d6b32e26703c6082839234f43769d5046b3ac7c910033911d1e71d8cd630a
+# Alpine zlib CVE-2026-4738: the base ships 1.3.2-r1 and v3.24/main serves
+# the fixed 1.4-r0. A floor, not a pin: the build fails while the index
+# lacks it, and drop this step once the alpine:3.24 pin ships >= 1.4-r0.
+RUN apk add --no-cache 'zlib>=1.4-r0'
 RUN addgroup -g 10002 sidecar && adduser -D -H -u 10002 -G sidecar -s /sbin/nologin sidecar \
  && mkdir -p /etc/anvilkit/anvilkit-job-access-sidecar
 COPY --from=build /out/anvilkit-job-access-sidecar /usr/local/bin/anvilkit-job-access-sidecar
