@@ -63,8 +63,13 @@ func TestForgedCredentialsTransferNoIdentity(t *testing.T) {
 
 	t.Run("the candidate socket closes a root peer that claims the candidate UID", func(t *testing.T) {
 		c := dial(layout.Candidate.Name)
+		// The listener rejects the peer at accept, from SO_PEERCRED alone, and closes it; the forged claim may
+		// arrive after the close, and the write then fails with EPIPE or ECONNRESET. The rejection below still
+		// names the kernel's identity. Any other write error fails.
 		_, _, err := c.WriteMsgUnix(payload, forged, nil)
-		require.NoError(t, err, "root may claim another PID and UID")
+		if !errors.Is(err, unix.EPIPE) && !errors.Is(err, unix.ECONNRESET) {
+			require.NoError(t, err, "root may claim another PID and UID")
+		}
 		select {
 		case p := <-rejected:
 			require.Equal(t, uint32(0), p.UID, "the kernel's UID, not the claimed 10001")
